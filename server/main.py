@@ -18,6 +18,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from server.inference import answer_video_question, inference_mode
+
 
 ROOT = Path(__file__).resolve().parent
 UPLOADS = ROOT / "uploads"
@@ -129,12 +131,13 @@ def video_record(video_id: str) -> sqlite3.Row:
 
 @app.get("/api/health")
 def health() -> dict[str, str]:
-    return {"status": "ok", "mode": os.getenv("INFERENCE_MODE", "demo")}
+    return {"status": "ok", "mode": inference_mode()}
 
 
 @app.post("/api/videos/upload", status_code=201)
 async def upload_video(request: Request, file: UploadFile = File(...)) -> dict:
-    enforce_rate_limit(f"upload:{request.client.host if request.client else 'unknown'}", limit=3)
+    upload_limit = int(os.getenv("UPLOADS_PER_HOUR", "20"))
+    enforce_rate_limit(f"upload:{request.client.host if request.client else 'unknown'}", limit=upload_limit)
     mime = file.content_type or mimetypes.guess_type(file.filename or "")[0] or ""
     if mime not in ALLOWED_MIME:
         raise HTTPException(status_code=415, detail="Unsupported video format")
@@ -185,7 +188,7 @@ def summary(video_id: str) -> dict:
             {"timestamp": round(duration * 0.58, 1), "label": "Key moment"},
             {"timestamp": round(duration * 0.86, 1), "label": "Conclusion"},
         ],
-        "inference_mode": os.getenv("INFERENCE_MODE", "demo"),
+        "inference_mode": inference_mode(),
     }
 
 
@@ -210,7 +213,20 @@ async def stream_chat(request: Request, payload: ChatRequest) -> StreamingRespon
     remaining = enforce_rate_limit(f"chat:{request.client.host if request.client else 'unknown'}")
     video = video_record(payload.video_id)
     conversation_id = payload.conversation_id or uuid.uuid4().hex
-    answer = grounded_answer(payload.message, video["duration"] or 12)
+    with db() as connection:
+        history_rows = connection.execute(
+            "SELECT role, content FROM messages WHERE video_id = ? ORDER BY created_at DESC LIMIT 8",
+            (payload.video_id,),
+        ).fetchall()
+    history = [dict(row) for row in reversed(history_rows)]
+    answer = await asyncio.to_thread(
+        answer_video_question,
+        Path(video["path"]),
+        payload.message,
+        history,
+        video["duration"] or 12,
+        grounded_answer,
+    )
     now = int(time.time())
     with db() as connection:
         connection.execute("INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?)", (uuid.uuid4().hex, payload.video_id, conversation_id, "user", payload.message, now))

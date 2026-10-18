@@ -123,6 +123,21 @@ scene map, timestamp navigation, overview, and conversational flow with the
 included cinematic sample. If the API is unavailable, the interface gracefully
 continues in browser-only demo mode.
 
+For real semantic Q&A over arbitrary uploaded videos, configure a vision model
+before starting the app:
+
+```bash
+export OPENAI_API_KEY="your-key"
+# Optional; defaults to gpt-4.1-mini
+export OPENAI_VISION_MODEL="gpt-4.1-mini"
+npm run dev
+```
+
+The server uniformly samples frames, attaches their timestamps, and sends those
+frames with the question and recent conversation context. Without credentials,
+the included sample remains fully interactive and other uploads show a clear
+configuration message instead of returning invented answers.
+
 The server defaults to `INFERENCE_MODE=demo`. Its summary and SSE chat endpoints
 are deliberately isolated behind `server/main.py`, providing a single integration
 point for either the local `video_chatgpt` inference code or a hosted multimodal

@@ -64,6 +64,7 @@ function App() {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
   const [streaming, setStreaming] = useState(false);
+  const [playbackError, setPlaybackError] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [remaining, setRemaining] = useState(50);
   const [toast, setToast] = useState('');
@@ -83,15 +84,19 @@ function App() {
   async function sendUpload(file) {
     const form = new FormData();
     form.append('file', file);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 20000);
     try {
-      const response = await fetch(`${API_BASE}/api/videos/upload`, { method: 'POST', body: form });
+      const response = await fetch(`${API_BASE}/api/videos/upload`, { method: 'POST', body: form, signal: controller.signal });
       if (!response.ok) throw new Error('Upload failed');
       const uploaded = await response.json();
       setVideoId(uploaded.id);
       setToast('Video safely added to your library');
     } catch {
       setVideoId('');
-      setToast('Demo mode · analysis stays in this browser');
+      setToast('Video opened locally · backend connection unavailable');
+    } finally {
+      clearTimeout(timeout);
     }
   }
 
@@ -108,18 +113,19 @@ function App() {
     setVideoUrl(demo ? demoVideoPath : URL.createObjectURL(file));
     setFileName(demo ? 'Alpine trail — demo.webm' : file.name);
     setVideoId('');
+    setPlaybackError(false);
     setMessages([]);
     setCurrentTime(0);
     setProcessing(true);
     setProgress(8);
     setPage('studio');
     const timer = setInterval(() => setProgress(old => Math.min(94, old + Math.ceil(Math.random() * 11))), 160);
-    await sendUpload(file);
     setTimeout(() => {
       clearInterval(timer);
       setProgress(100);
       setProcessing(false);
-    }, 1100);
+    }, 1200);
+    void sendUpload(file);
   }
 
   async function loadDemo() {
@@ -277,7 +283,8 @@ function App() {
         <section className="studio-video">
           <div className="studio-heading"><div><span className="overline">VIDEO UNDERSTANDING</span><h1>{fileName}</h1></div><div className="studio-meta"><span><i />{processing ? 'Understanding' : 'Ready for questions'}</span><button onClick={() => fileRef.current?.click()}><Plus size={14} />Replace</button></div></div>
           <div className="video-frame">
-            {videoUrl ? <video ref={videoRef} src={videoUrl} poster="/demo/trail-runner.png" controls onTimeUpdate={e => setCurrentTime(e.currentTarget.currentTime)} onLoadedMetadata={e => setDuration(e.currentTarget.duration || 12)} /> : <button className="empty-player" onClick={() => fileRef.current?.click()}><UploadCloud size={26} /><strong>Choose a video</strong></button>}
+            {videoUrl ? <video ref={videoRef} src={videoUrl} poster="/demo/trail-runner.png" controls onError={() => setPlaybackError(true)} onTimeUpdate={e => setCurrentTime(e.currentTarget.currentTime)} onLoadedMetadata={e => { setPlaybackError(false); setDuration(e.currentTarget.duration || 12); }} /> : <button className="empty-player" onClick={() => fileRef.current?.click()}><UploadCloud size={26} /><strong>Choose a video</strong></button>}
+            {playbackError && <div className="playback-error"><FileVideo2 size={22} /><strong>This video codec cannot play in your browser</strong><p>The file was still uploaded for analysis. MP4 (H.264) and WebM provide the best playback support.</p><button onClick={() => fileRef.current?.click()}>Choose another file</button></div>}
             {processing && <div className="analysis-overlay"><div className="scan-line" /><span className="analysis-orb"><Sparkles size={22} /></span><strong>Understanding what happens</strong><p>Mapping scenes · tracking motion · reading context</p><div className="analysis-progress"><i style={{ width: `${progress}%` }} /></div><small>{progress}% complete</small></div>}
           </div>
           {!processing && videoUrl && <div className="scene-map">
@@ -299,7 +306,7 @@ function App() {
       </main>}
     </div>
 
-    <input ref={fileRef} type="file" hidden accept="video/mp4,video/quicktime,video/webm,video/x-msvideo" onChange={e => loadFile(e.target.files[0])} />
+    <input ref={fileRef} type="file" hidden accept="video/mp4,video/quicktime,video/webm,video/x-msvideo" onClick={e => { e.currentTarget.value = ''; }} onChange={e => { const selected = e.target.files?.[0]; if (selected) loadFile(selected); }} />
     {toast && <div className="toast"><Check size={14} />{toast}</div>}
   </div>;
 }
