@@ -90,6 +90,43 @@ cd ..
 
 ## 💻 Interactive Demo
 
+### Modern workspace (recommended)
+
+The repository now includes a polished React workspace and a FastAPI service. The
+frontend runs in a self-contained demo mode out of the box, so video upload,
+playback, scene navigation, timestamp jumps, chat streaming, and history can be
+explored without downloading model weights.
+
+```bash
+# Install the web and API dependencies once
+npm install
+python -m venv .venv
+source .venv/bin/activate
+pip install -r server/requirements.txt
+
+# Start the complete platform
+npm run dev
+```
+
+The command opens the correct app at `http://localhost:4310` and starts its API
+on `http://localhost:8787`. These dedicated ports avoid collisions with other
+local projects. API documentation is available at `http://localhost:8787/docs`.
+
+Use the **Try the 12 sec demo** action to explore the complete upload, analysis,
+scene map, timestamp navigation, overview, and conversational flow with the
+included cinematic sample. If the API is unavailable, the interface gracefully
+continues in browser-only demo mode.
+
+The server defaults to `INFERENCE_MODE=demo`. Its summary and SSE chat endpoints
+are deliberately isolated behind `server/main.py`, providing a single integration
+point for either the local `video_chatgpt` inference code or a hosted multimodal
+provider. Uploaded media and the local SQLite database are ignored by Git.
+
+See [Platform Roadmap](docs/PLATFORM_ROADMAP.md) for the prioritized path from
+this local foundation to a production SaaS release.
+
+### Legacy Gradio demo
+
 Launch the local interactive Gradio dashboard:
 
 ```bash

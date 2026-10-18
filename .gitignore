@@ -145,3 +145,8 @@ Thumbs.db
 checkpoints/
 Video-ChatGPT_7B-1.1_Checkpoints/
 eval_results/
+
+# Modern web workspace and local API data
+node_modules/
+server/uploads/
+server/*.db

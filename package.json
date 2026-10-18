@@ -1,0 +1,22 @@
+{
+  "name": "understandvideo-ai-workspace",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently --kill-others --names web,api --prefix-colors green,cyan \"npm:dev:web\" \"npm:dev:api\"",
+    "dev:web": "vite --host 127.0.0.1 --port 4310 --strictPort --open",
+    "dev:api": "python3 -m uvicorn server.main:app --reload --host 127.0.0.1 --port 8787",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "latest",
+    "concurrently": "latest",
+    "lucide-react": "latest",
+    "vite": "latest",
+    "react": "latest",
+    "react-dom": "latest"
+  },
+  "devDependencies": {}
+}
