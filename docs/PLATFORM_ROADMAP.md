@@ -7,15 +7,19 @@ features.
 
 ## Product north star
 
-Users should be able to upload a video, receive a trustworthy visual overview,
-ask follow-up questions, and jump to supporting evidence in under two minutes.
+Users should be able to upload an existing video, receive a trustworthy visual
+overview, ask follow-up questions about its contents, and jump to supporting
+evidence in under two minutes.
 The experience should feel as immediate as search and as grounded as a video
 editor's timeline.
+
+Video generation and video editing are explicit non-goals. The platform exists
+to understand supplied footage and support evidence-grounded conversation.
 
 ## Milestone 0 — Modern product foundation (shipped)
 
 - Responsive dashboard, library, upload workspace, video player, and AI panel.
-- Built-in sample film and generated scene imagery for zero-setup onboarding.
+- Built-in sample footage and scene thumbnails for zero-setup onboarding.
 - Validated 100 MB uploads, metadata extraction, SQLite records, SSE chat, and
   per-client request quotas.
 - Timeline scene markers and clickable timestamps in answers.

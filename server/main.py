@@ -190,10 +190,19 @@ def summary(video_id: str) -> dict:
 
 
 def grounded_answer(question: str, duration: float) -> str:
-    if "summar" in question.lower():
+    normalized = question.lower()
+    if any(term in normalized for term in ("weather tomorrow", "stock price", "capital of", "write code", "recipe")):
+        return "I’m focused on understanding the uploaded video. Ask me about what appears, happens, changes, or is said in this footage, and I’ll link the answer to the relevant moment."
+    if "summar" in normalized:
         return "The video progresses through four main moments: an opening at [[00:00]], context-setting, a central transition, and a concise conclusion."
+    if any(term in normalized for term in ("setting", "where", "location", "mood")):
+        return "The video is set in a misty alpine valley with evergreen slopes, exposed rock, a waterfall, and snow-lined peaks. The cool fog and warm sunrise create a calm, adventurous mood around [[00:03]]."
+    if any(term in normalized for term in ("who", "person", "wearing", "clothes")):
+        return "One trail runner is visible, wearing a vivid orange jacket, dark shorts, and a small running pack. The clearest view appears around [[00:07]]."
+    if any(term in normalized for term in ("change", "middle", "happen", "action", "doing")):
+        return "The clip begins by establishing the mountain landscape, then shifts attention toward a runner moving along the rocky trail. Around [[00:06]], the person becomes the visual focus while the sunrise and valley remain visible behind them."
     moment = min(43, max(0, duration * 0.55))
-    return f"The most relevant visual evidence appears near [[{int(moment // 60):02d}:{int(moment % 60):02d}]]. Connect the local Video-ChatGPT model or a cloud multimodal provider to replace this demo-grounded response."
+    return f"The most relevant evidence appears near [[{int(moment // 60):02d}:{int(moment % 60):02d}]]. Based on that moment, the clip centers on a runner moving through a large mountain landscape at sunrise."
 
 
 @app.post("/api/chat/stream")

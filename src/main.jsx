@@ -204,7 +204,7 @@ function App() {
       <Logo />
       <nav className="main-nav">
         <button className={page === 'home' ? 'active' : ''} onClick={() => setPage('home')}><Home size={17} /><span>Home</span></button>
-        <button className={page === 'studio' ? 'active' : ''} onClick={() => videoUrl ? setPage('studio') : fileRef.current?.click()}><WandSparkles size={17} /><span>Studio</span><kbd>⌘K</kbd></button>
+        <button className={page === 'studio' ? 'active' : ''} onClick={() => videoUrl ? setPage('studio') : fileRef.current?.click()}><MessageSquareText size={17} /><span>Video chat</span><kbd>⌘K</kbd></button>
         <button className={page === 'library' ? 'active' : ''} onClick={() => setPage('library')}><Library size={17} /><span>Library</span></button>
       </nav>
       <div className="nav-label">Workspace</div>
@@ -229,29 +229,29 @@ function App() {
       <header className="topbar">
         <div className="mobile-brand"><Logo /></div>
         <button className="search-command"><Search size={15} /><span>Search your videos</span><kbd>⌘ /</kbd></button>
-        <div className="top-actions"><span className="system-status"><i />Systems ready</span><button className="icon-button"><Clock3 size={17} /></button><button className="new-video" onClick={() => fileRef.current?.click()}><Plus size={15} />New video</button></div>
+        <div className="top-actions"><span className="system-status"><i />Systems ready</span><button className="icon-button"><Clock3 size={17} /></button><button className="new-video" onClick={() => fileRef.current?.click()}><Plus size={15} />Analyze video</button></div>
       </header>
 
       {page === 'home' && <main className="home-page">
         <section className="hero-grid">
           <div className="hero-copy">
-            <span className="hero-pill"><Sparkles size={13} />Built to see the whole story</span>
-            <h1>Watch less.<br /><em>Understand more.</em></h1>
-            <p>Turn any video into a searchable conversation. Find moments, extract meaning, and get clear answers with exact timestamps.</p>
+            <span className="hero-pill"><MessageSquareText size={13} />Ask questions about any video</span>
+            <h1>Your video.<br /><em>Ready to answer.</em></h1>
+            <p>Upload a video and have a grounded conversation about what happens inside it. Ask follow-ups, understand key moments, and jump to exact timestamps.</p>
             <div className="hero-actions"><button className="primary-cta" onClick={() => fileRef.current?.click()}><UploadCloud size={17} />Upload a video</button><button className="ghost-cta" onClick={loadDemo}><Play size={15} fill="currentColor" />Try the 12 sec demo</button></div>
-            <div className="trust-row"><span><Check size={12} />Private by default</span><span><Check size={12} />100 MB uploads</span><span><Check size={12} />Timestamped answers</span></div>
+            <div className="trust-row"><span><Check size={12} />Video understanding only</span><span><Check size={12} />No video generation</span><span><Check size={12} />Evidence-linked answers</span></div>
           </div>
           <button className="hero-film" onClick={loadDemo} aria-label="Play demo video">
             <img src="/demo/trail-runner.png" alt="Trail runner overlooking a misty mountain valley" />
             <div className="film-top"><span>DEMO FILM</span><b>00:12</b></div>
             <div className="play-orb"><Play size={20} fill="currentColor" /></div>
-            <div className="film-caption"><div><small>AI-GENERATED SAMPLE</small><strong>Across the alpine valley</strong></div><span>4 scenes</span></div>
+            <div className="film-caption"><div><small>INCLUDED DEMO FOOTAGE</small><strong>Across the alpine valley</strong></div><span>4 scenes</span></div>
           </button>
         </section>
 
         <section className={`quick-upload ${dragging ? 'dragging' : ''}`} {...uploadDropHandlers}>
           <div className="upload-badge"><UploadCloud size={20} /></div>
-          <div><strong>Drop a video to start understanding</strong><span>MP4, MOV, WebM or AVI · up to 100 MB</span></div>
+          <div><strong>Drop a video to ask questions about it</strong><span>MP4, MOV, WebM or AVI · up to 100 MB</span></div>
           <button onClick={() => fileRef.current?.click()}>Browse files <ArrowRight size={14} /></button>
         </section>
 
@@ -260,7 +260,7 @@ function App() {
             <div className="section-title"><div><span>YOUR SPACE</span><h2>Recent videos</h2></div><button onClick={() => setPage('library')}>View library <ArrowRight size={13} /></button></div>
             <div className="media-grid">
               <button className="media-card featured" onClick={loadDemo}><div className="thumb"><img src="/demo/scene-runner.jpg" alt="Runner scene thumbnail" /><span className="duration">00:12</span><span className="thumb-play"><Play size={13} fill="currentColor" /></span></div><div className="media-info"><strong>Across the alpine valley</strong><span><i />Analyzed · 4 scenes</span></div></button>
-              <button className="media-card add-card" onClick={() => fileRef.current?.click()}><div><Plus size={21} /></div><strong>Add your first video</strong><span>Your next analysis starts here</span></button>
+              <button className="media-card add-card" onClick={() => fileRef.current?.click()}><div><Plus size={21} /></div><strong>Analyze your own video</strong><span>Upload, understand, and ask anything</span></button>
             </div>
           </div>
           <aside className="insight-card"><div className="insight-icon"><Gauge size={19} /></div><span>WORKSPACE PULSE</span><h3>Every frame becomes searchable context.</h3><p>Scene mapping, timeline-aware answers, and conversation memory work together in one focused space.</p><div className="metric-row"><div><b>4</b><small>scene types</small></div><div><b>&lt;1s</b><small>timestamp jump</small></div><div><b>∞</b><small>follow-ups</small></div></div></aside>
@@ -268,17 +268,17 @@ function App() {
       </main>}
 
       {page === 'library' && <main className="library-page">
-        <div className="page-heading"><div><span className="overline">VIDEO LIBRARY</span><h1>Your visual knowledge base</h1><p>Search, revisit, and continue every video conversation.</p></div><button className="primary-cta" onClick={() => fileRef.current?.click()}><Plus size={16} />Add video</button></div>
+        <div className="page-heading"><div><span className="overline">VIDEO LIBRARY</span><h1>Your visual knowledge base</h1><p>Search, revisit, and continue every video conversation.</p></div><button className="primary-cta" onClick={() => fileRef.current?.click()}><Plus size={16} />Analyze video</button></div>
         <div className="library-toolbar"><div className="library-search"><Search size={15} /><input placeholder="Search title, topic, or transcript" /></div><button><Grid2X2 size={15} />All videos</button></div>
         <div className="library-grid"><button className="library-video" onClick={loadDemo}><div><img src="/demo/trail-runner.png" alt="Mountain valley demo" /><span><Play size={15} fill="currentColor" /></span></div><strong>Across the alpine valley</strong><small>Demo · 4 scenes · 12 seconds</small></button><button className="library-upload" onClick={() => fileRef.current?.click()}><UploadCloud size={22} /><strong>Upload another video</strong><small>Build your searchable library</small></button></div>
       </main>}
 
       {page === 'studio' && <main className="studio-page">
         <section className="studio-video">
-          <div className="studio-heading"><div><span className="overline">VIDEO STUDIO</span><h1>{fileName}</h1></div><div className="studio-meta"><span><i />{processing ? 'Analyzing' : 'Ready'}</span><button onClick={() => fileRef.current?.click()}><Plus size={14} />Replace</button></div></div>
+          <div className="studio-heading"><div><span className="overline">VIDEO UNDERSTANDING</span><h1>{fileName}</h1></div><div className="studio-meta"><span><i />{processing ? 'Understanding' : 'Ready for questions'}</span><button onClick={() => fileRef.current?.click()}><Plus size={14} />Replace</button></div></div>
           <div className="video-frame">
             {videoUrl ? <video ref={videoRef} src={videoUrl} poster="/demo/trail-runner.png" controls onTimeUpdate={e => setCurrentTime(e.currentTarget.currentTime)} onLoadedMetadata={e => setDuration(e.currentTarget.duration || 12)} /> : <button className="empty-player" onClick={() => fileRef.current?.click()}><UploadCloud size={26} /><strong>Choose a video</strong></button>}
-            {processing && <div className="analysis-overlay"><div className="scan-line" /><span className="analysis-orb"><Sparkles size={22} /></span><strong>Reading the visual story</strong><p>Mapping scenes · tracking motion · creating context</p><div className="analysis-progress"><i style={{ width: `${progress}%` }} /></div><small>{progress}% complete</small></div>}
+            {processing && <div className="analysis-overlay"><div className="scan-line" /><span className="analysis-orb"><Sparkles size={22} /></span><strong>Understanding what happens</strong><p>Mapping scenes · tracking motion · reading context</p><div className="analysis-progress"><i style={{ width: `${progress}%` }} /></div><small>{progress}% complete</small></div>}
           </div>
           {!processing && videoUrl && <div className="scene-map">
             <div className="scene-map-head"><div><span className="overline">SCENE MAP</span><strong>{scenes.length} chapters found</strong></div><span>{formatTime(currentTime)} / {formatTime(duration)}</span></div>

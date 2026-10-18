@@ -97,6 +97,12 @@ frontend runs in a self-contained demo mode out of the box, so video upload,
 playback, scene navigation, timestamp jumps, chat streaming, and history can be
 explored without downloading model weights.
 
+UnderstandVideo is a **video understanding and conversational Q&A platform**. It
+does not generate or edit videos. Users provide an existing video, then ask
+questions about its events, people, objects, setting, sequence, or meaning. Every
+answer should remain grounded in the uploaded video and link back to supporting
+timestamps whenever possible.
+
 ```bash
 # Install the web and API dependencies once
 npm install
