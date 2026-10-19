@@ -29,10 +29,13 @@ jobs:
           VIDEO_WORKER_TOKEN: ci-only-token-0123456789abcdef0123456789
           DATABASE_URL: postgresql://ci-placeholder
           REDIS_URL: redis://ci-placeholder
+          OBJECT_STORAGE_PROVIDER: supabase
           OBJECT_STORAGE_BUCKET: ci-private-bucket
-          OBJECT_STORAGE_ENDPOINT: https://s3.example.com
+          OBJECT_STORAGE_ENDPOINT: https://example.supabase.co/storage/v1
+          SUPABASE_SERVICE_ROLE_KEY: ci-placeholder-service-role-key
           OIDC_ISSUER_URL: https://example.supabase.co/auth/v1
           OIDC_AUDIENCE: authenticated
+          AUTH_MODE: required
         run: |
           npm run validate:production
           docker compose -f compose.production.yml config --quiet

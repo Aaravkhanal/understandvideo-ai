@@ -31,6 +31,7 @@ from pydantic import BaseModel, Field, HttpUrl, field_validator
 from server.analysis import AnalysisError, extract_scene_thumbnails
 from server.auth import Identity, auth_mode, verify_bearer_token
 from server.inference import answer_video_question, inference_mode, is_demo_video
+from server.job_queue import notify_jobs
 from server.remote_import import RemoteImportCancelled, RemoteImportError, import_remote_video, platform_hosts, validate_public_https_url
 from server.storage import LocalStorage, StorageError, SupabaseStorage
 from server.transcription import NoAudioTrack, TranscriptionError, TranscriptionUnavailable, transcribe_video
@@ -862,6 +863,7 @@ def queue_analysis(connection: sqlite3.Connection, video_id: str) -> None:
         """,
         (uuid.uuid4().hex, video_id, now, now),
     )
+    notify_jobs()
 
 
 def queue_transcript(connection: sqlite3.Connection, video_id: str) -> None:
@@ -874,6 +876,7 @@ def queue_transcript(connection: sqlite3.Connection, video_id: str) -> None:
         """,
         (uuid.uuid4().hex, video_id, now, now),
     )
+    notify_jobs()
 
 
 def run_analysis_job(video_id: str) -> None:
@@ -1569,6 +1572,7 @@ def create_import_job(request: Request, background_tasks: BackgroundTasks, paylo
             """,
             (import_id, active_workspace_id(), str(payload.url), now, now),
         )
+    notify_jobs()
     background_tasks.add_task(run_import_job, import_id)
     return {"id": import_id, "status": "queued", "progress": 0, "detail": "Waiting to start"}
 
@@ -1666,6 +1670,7 @@ def retry_import_job(import_id: str, background_tasks: BackgroundTasks) -> dict:
             (int(time.time()), import_id),
         )
     cancelled_import_ids.discard(import_id)
+    notify_jobs()
     background_tasks.add_task(run_import_job, import_id)
     return {"id": import_id, "status": "queued", "progress": 0, "detail": "Waiting to retry"}
 

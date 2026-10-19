@@ -86,7 +86,8 @@ available instead of inventing an answer.
 - Workspace search across video titles, source links, transcripts, notes, and
   saved conversation messages, with user-managed searchable tags.
 - SQLite metadata and conversation persistence, scoped by video and conversation.
-- Optional OpenAI vision inference over uniformly sampled frames.
+- Free local Ollama vision inference over sampled frames, with optional OpenAI
+  inference as a cloud alternative.
 - Honest browser-only fallback and a zero-setup included demo.
 - API regression tests for validation, limits, and conversation isolation.
 
@@ -100,8 +101,10 @@ available instead of inventing an answer.
   video and audio remain within `MAX_UPLOAD_BYTES`.
 - Local transcription runs on the machine and may be slower than real time on long
   videos. The first run downloads the selected speech and speaker models.
-- The included queue is durable and separately runnable but remains SQLite/local;
-  multi-machine execution needs PostgreSQL/Redis and object storage.
+- The included queue is durable and separately runnable. Redis wake-ups and a
+  distributed worker lease are used when `REDIS_URL` is configured, while the
+  database remains the recovery source of truth. Multi-machine execution still
+  requires the pending PostgreSQL metadata migration.
 - ClamAV scanning is enforced only when `MALWARE_SCAN_MODE=required`. The supplied
   production stack runs decoding in a constrained worker container; stronger
   per-file sandboxing can be added with short-lived jobs on the deployment platform.
@@ -233,6 +236,10 @@ Copy `.env.example` values into your shell or preferred environment manager.
 | `OPENAI_REQUEST_TIMEOUT` | `60` | Cloud inference timeout in seconds. |
 | `OPENAI_TRANSCRIPTION_MODEL` | `whisper-1` | Model used for timestamped speech transcription. |
 | `OPENAI_TRANSCRIPTION_TIMEOUT` | `180` | Transcription request timeout in seconds. |
+| `OLLAMA_URL` | `http://127.0.0.1:11434` | Local Ollama service used for free visual question answering. |
+| `OLLAMA_VISION_MODEL` | unset | Enables local vision inference; recommended value is `qwen3-vl:4b`. |
+| `OLLAMA_FRAME_COUNT` | `6` | Number of timestamped frames sent to the local vision model. |
+| `OLLAMA_REQUEST_TIMEOUT` | `180` | Local model timeout in seconds, including first-load time. |
 | `TRANSCRIPTION_PROVIDER` | `local` | Use free `local` models or optional paid `openai` transcription. |
 | `LOCAL_WHISPER_MODEL` | `small` | faster-whisper model size downloaded on first use. |
 | `LOCAL_WHISPER_DEVICE` | `cpu` | Local transcription device. |
@@ -259,14 +266,15 @@ Copy `.env.example` values into your shell or preferred environment manager.
 | `UPLOAD_ROOT` | `server/uploads` | Local or mounted private-media working directory. |
 | `DATABASE_PATH` | `server/understandvideo.db` | SQLite path used by local and single-host worker deployments. |
 | `JOB_POLL_SECONDS` | `3` | Poll interval for the standalone durable job worker. |
+| `REDIS_URL` | unset | Optional Redis wake-up and multi-worker lease; durable polling remains as fallback. |
 | `REMOTE_MEDIA_HOSTS` | unset | Optional comma-separated platform hosts added by the server owner. |
 | `CORS_ORIGINS` | local web URLs | Comma-separated browser origins allowed by the API. |
 | `VITE_API_URL` | same origin | Optional direct API base URL for the frontend. |
 
 ### Hardened production worker
 
-`compose.production.yml` provides a separately isolated job worker and a private
-ClamAV service. The worker runs as a non-root user with all Linux capabilities
+`compose.production.yml` provides a separately isolated job worker, a private
+ClamAV service, and private persistent Redis coordination. The worker runs as a non-root user with all Linux capabilities
 dropped, a read-only root filesystem, a no-execute temporary filesystem, a 2 CPU
 limit, 4 GB memory limit, process/file-descriptor limits, and a 512 MB file-size
 limit. Uploaded media and the SQLite transition database live on dedicated
@@ -278,8 +286,8 @@ volumes rather than inside the container layer.
 3. Run `npm run validate:production` in the configured deployment environment.
 4. Start the services with `docker compose -f compose.production.yml up -d --build`.
 
-The stack initializes volume ownership once, waits for the private ClamAV daemon
-to become healthy, and only then starts the non-root worker. Its lightweight image
+The stack initializes volume ownership once, waits for ClamAV and Redis to become
+healthy, and only then starts the non-root worker. Its lightweight image
 includes local Whisper transcription but deliberately excludes pyannote/Torch;
 run speaker diarization in the configured local model environment or a dedicated
 CPU/GPU model service, rather than adding the full model stack to every import worker.

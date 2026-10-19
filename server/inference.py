@@ -40,6 +40,8 @@ def is_demo_video(path: Path) -> bool:
 def inference_mode() -> str:
     if os.getenv("VIDEO_WORKER_URL"):
         return "video-worker"
+    if os.getenv("OLLAMA_VISION_MODEL"):
+        return "local-vision"
     if os.getenv("OPENAI_API_KEY"):
         return "cloud-vision"
     return os.getenv("INFERENCE_MODE", "demo")
@@ -145,6 +147,47 @@ class OpenAIInferenceAdapter:
             return "I couldn’t reach the configured vision model. Your upload is safe; retry the question after checking the server connection."
 
 
+class OllamaInferenceAdapter:
+    def answer(self, request: InferenceRequest) -> str:
+        frames = sample_video_frames(request.path, count=int(os.getenv("OLLAMA_FRAME_COUNT", "6")))
+        if not frames:
+            return "I couldn’t extract readable frames from this video. Try an MP4 encoded with H.264 or a WebM file."
+        history_text = "\n".join(f"{item['role']}: {item['content']}" for item in request.history[-6:])
+        frame_labels = ", ".join(f"image {index + 1} = {seconds:.1f}s" for index, (seconds, _) in enumerate(frames))
+        transcript_text = "\n".join(
+            f"[{float(item['start_seconds']):.1f}s–{float(item['end_seconds']):.1f}s] {item['text']}"
+            for item in (request.transcript or [])[:80]
+        )
+        prompt = (
+            "Answer only from the supplied video frames and transcript. Never invent details. "
+            "Cite supporting moments using exactly [[MM:SS]]. If evidence is insufficient, say so. "
+            "Keep the answer concise and conversational.\n\n"
+            f"Duration: {request.duration:.1f}s. Image timing: {frame_labels}.\n"
+            f"Transcript:\n{transcript_text or '(none)'}\n"
+            f"Conversation:\n{history_text or '(none)'}\n\nQuestion: {request.question}"
+        )
+        body = json.dumps({
+            "model": os.getenv("OLLAMA_VISION_MODEL", "qwen3-vl:4b"),
+            "stream": False,
+            "messages": [{"role": "user", "content": prompt, "images": [image for _, image in frames]}],
+            "options": {"temperature": 0.1},
+        }).encode("utf-8")
+        endpoint = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/") + "/api/chat"
+        try:
+            ollama_request = urllib.request.Request(endpoint, data=body, method="POST", headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(ollama_request, timeout=float(os.getenv("OLLAMA_REQUEST_TIMEOUT", "180"))) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            answer = str(payload.get("message", {}).get("content", "")).strip()
+            if not answer:
+                raise ValueError("Ollama returned an empty answer")
+            return answer
+        except Exception:
+            logger.exception("Local Ollama vision inference failed for %s", request.path.name)
+            if is_demo_video(request.path):
+                return request.fallback(request.question, request.duration)
+            return "The local vision model is temporarily unavailable. Your video is safe; retry after the model finishes loading."
+
+
 class HttpWorkerInferenceAdapter:
     def answer(self, request: InferenceRequest) -> str:
         url = os.environ["VIDEO_WORKER_URL"].rstrip("/") + "/answer"
@@ -179,6 +222,8 @@ class HttpWorkerInferenceAdapter:
 def inference_adapter() -> InferenceAdapter:
     if os.getenv("VIDEO_WORKER_URL"):
         return HttpWorkerInferenceAdapter()
+    if os.getenv("OLLAMA_VISION_MODEL"):
+        return OllamaInferenceAdapter()
     if os.getenv("OPENAI_API_KEY"):
         return OpenAIInferenceAdapter()
     return DemoInferenceAdapter()

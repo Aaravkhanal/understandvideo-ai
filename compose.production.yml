@@ -33,6 +33,29 @@ services:
     networks:
       - private-services
 
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    restart: unless-stopped
+    expose:
+      - "6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - private-services
+
   jobs:
     build:
       context: .
@@ -46,10 +69,13 @@ services:
       MALWARE_SCAN_MODE: required
       UPLOAD_ROOT: /app/server/uploads
       DATABASE_PATH: /app/server/runtime/understandvideo.db
+      REDIS_URL: redis://redis:6379/0
     depends_on:
       storage-init:
         condition: service_completed_successfully
       clamav:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     volumes:
       - media:/app/server/uploads
@@ -80,6 +106,7 @@ volumes:
   clamav-signatures:
   media:
   metadata:
+  redis-data:
 
 networks:
   private-services:

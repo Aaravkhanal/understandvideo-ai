@@ -57,13 +57,13 @@ to understand supplied footage and support evidence-grounded conversation.
 Success check: a first-time contributor can clone, install, launch, and complete
 the sample-video conversation without model weights.
 
-## Milestone 1 — Real understanding engine (next)
+## Milestone 1 — Real understanding engine (in progress)
 
-1. Connect the shipped worker interface to the local Video-ChatGPT driver.
-2. Connect the local Video-ChatGPT/CLIP pipeline without loading model state in
-   the request process.
-3. Add a cloud multimodal driver for machines without CUDA.
-4. Extend the shipped frame/transcript jobs with speaker diarization.
+1. Validate and tune the shipped free Ollama/Qwen3-VL driver on representative videos.
+2. Keep the dedicated worker interface available for larger local models without
+   loading model state in the request process.
+3. Use the shipped cloud multimodal driver only when an operator chooses it.
+4. Evaluate and tune the shipped local Whisper plus pyannote speaker diarization.
 5. Store scene-level evidence and require every answer to cite time ranges.
 6. Add cancel, retry, and visible failure states for processing jobs.
 
@@ -85,7 +85,8 @@ existing video conversation without cross-account data exposure.
 
 ## Milestone 3 — Production scale and quality
 
-1. Move analysis to Redis-backed workers with idempotent jobs and retries.
+1. Extend the shipped Redis wake-up and distributed-lease worker coordination
+   after metadata is migrated from SQLite to PostgreSQL.
 2. Add token-bucket limits by account tier, file duration, and model cost.
 3. Instrument latency, model failures, queue depth, and answer quality.
 4. Add unit tests for validation and quotas, integration tests for upload/SSE,

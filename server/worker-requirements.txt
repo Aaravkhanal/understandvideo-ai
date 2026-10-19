@@ -8,3 +8,4 @@ imageio-ffmpeg>=0.6,<1
 faster-whisper>=1.2,<2
 # faster-whisper 1.2 still calls a PyAV option removed in newer releases.
 av>=14,<17
+redis>=5,<7
