@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
+import { createClient } from '@supabase/supabase-js';
 import {
   ArrowRight, ArrowUp, Check, ChevronRight,
   Clock3, Download, FileVideo2, Grid2X2,
@@ -13,6 +14,19 @@ import { formatTime, timestampPattern, timestampToSeconds } from './video-utils.
 const API_BASE = import.meta.env.VITE_API_URL?.replace(/\/$/, '') ?? '';
 const DEMO_VIDEO_PATH = '/demo/trail-runner-demo.webm';
 const DEFAULT_MAX_UPLOAD_BYTES = 100 * 1024 * 1024;
+const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL?.trim();
+const SUPABASE_KEY = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY?.trim();
+const supabase = SUPABASE_URL && SUPABASE_KEY ? createClient(SUPABASE_URL, SUPABASE_KEY) : null;
+const nativeFetch = window.fetch.bind(window);
+
+async function apiFetch(input, init = {}) {
+  const headers = new Headers(init.headers || {});
+  if (supabase) {
+    const { data } = await supabase.auth.getSession();
+    if (data.session?.access_token) headers.set('Authorization', `Bearer ${data.session.access_token}`);
+  }
+  return nativeFetch(input, { ...init, headers });
+}
 
 const DEMO_SCENES = [
   { time: 0, label: 'Valley reveal', note: 'A wide sunrise view establishes the alpine setting.', image: '/demo/scene-opening.jpg' },
@@ -64,7 +78,7 @@ function Logo() {
   return <div className="brand"><span className="brand-mark"><i /><i /><i /></span><span>understandvideo</span></div>;
 }
 
-function App() {
+function WorkspaceApp() {
   const [page, setPage] = useState('home');
   const [panel, setPanel] = useState('ask');
   const [videoUrl, setVideoUrl] = useState('');
@@ -155,7 +169,7 @@ function App() {
   useEffect(() => { if (!toast) return; const timeout = setTimeout(() => setToast(''), 2600); return () => clearTimeout(timeout); }, [toast]);
   useEffect(() => {
     const controller = new AbortController();
-    fetch(`${API_BASE}/api/config`, { signal: controller.signal })
+    apiFetch(`${API_BASE}/api/config`, { signal: controller.signal })
       .then(response => response.ok ? response.json() : Promise.reject(new Error('API unavailable')))
       .then(config => {
         setApiOnline(true);
@@ -173,7 +187,7 @@ function App() {
     const token = new URLSearchParams(window.location.search).get('share');
     if (!token || handledShareRef.current) return;
     handledShareRef.current = true;
-    fetch(`${API_BASE}/api/shares/${encodeURIComponent(token)}`)
+    apiFetch(`${API_BASE}/api/shares/${encodeURIComponent(token)}`)
       .then(response => response.ok ? response.json() : Promise.reject(new Error('Shared moment unavailable')))
       .then(shared => {
         pendingSeekRef.current = shared.timestamp;
@@ -197,7 +211,7 @@ function App() {
   }, []);
   useEffect(() => {
     const controller = new AbortController();
-    fetch(`${API_BASE}/api/videos`, { signal: controller.signal })
+    apiFetch(`${API_BASE}/api/videos`, { signal: controller.signal })
       .then(response => response.ok ? response.json() : [])
       .then(setLibraryVideos)
       .catch(() => {});
@@ -205,7 +219,7 @@ function App() {
   }, []);
   useEffect(() => {
     const controller = new AbortController();
-    fetch(`${API_BASE}/api/imports?active=true&limit=1`, { signal: controller.signal })
+    apiFetch(`${API_BASE}/api/imports?active=true&limit=1`, { signal: controller.signal })
       .then(response => response.ok ? response.json() : [])
       .then(items => {
         if (!items[0]) return;
@@ -240,7 +254,7 @@ function App() {
   async function refreshLibrary(query = '') {
     try {
       const suffix = query.trim() ? `?q=${encodeURIComponent(query.trim())}` : '';
-      const response = await fetch(`${API_BASE}/api/videos${suffix}`);
+      const response = await apiFetch(`${API_BASE}/api/videos${suffix}`);
       if (response.ok) setLibraryVideos(await response.json());
     } catch {
       // Keep the last usable library snapshot while the API reconnects.
@@ -254,7 +268,7 @@ function App() {
     activeConversationIdRef.current = conversation.id;
     setShowConversations(false);
     try {
-      const response = await fetch(`${API_BASE}/api/videos/${selectedVideoId}/messages?conversation_id=${encodeURIComponent(conversation.id)}`);
+      const response = await apiFetch(`${API_BASE}/api/videos/${selectedVideoId}/messages?conversation_id=${encodeURIComponent(conversation.id)}`);
       if (!response.ok) throw new Error('History unavailable');
       const history = await response.json();
       if (activeConversationIdRef.current === conversation.id) {
@@ -267,7 +281,7 @@ function App() {
 
   async function loadConversations(id, preferredId = '') {
     try {
-      const response = await fetch(`${API_BASE}/api/videos/${id}/conversations`);
+      const response = await apiFetch(`${API_BASE}/api/videos/${id}/conversations`);
       if (!response.ok) return;
       const items = await response.json();
       if (activeVideoIdRef.current !== id) return;
@@ -283,7 +297,7 @@ function App() {
   async function newConversation() {
     if (!videoId) return;
     try {
-      const response = await fetch(`${API_BASE}/api/videos/${videoId}/conversations`, {
+      const response = await apiFetch(`${API_BASE}/api/videos/${videoId}/conversations`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ title: 'New conversation' })
@@ -306,7 +320,7 @@ function App() {
     const title = conversationDraft.trim();
     if (!title) return;
     try {
-      const response = await fetch(`${API_BASE}/api/videos/${videoId}/conversations/${item.id}`, {
+      const response = await apiFetch(`${API_BASE}/api/videos/${videoId}/conversations/${item.id}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ title })
@@ -322,7 +336,7 @@ function App() {
   async function deleteConversation(item) {
     if (!videoId) return;
     try {
-      const response = await fetch(`${API_BASE}/api/videos/${videoId}/conversations/${item.id}`, { method: 'DELETE' });
+      const response = await apiFetch(`${API_BASE}/api/videos/${videoId}/conversations/${item.id}`, { method: 'DELETE' });
       if (!response.ok) throw new Error('Delete failed');
       const remainingConversations = conversations.filter(conversation => conversation.id !== item.id);
       setConversations(remainingConversations);
@@ -341,7 +355,7 @@ function App() {
 
   async function loadOverview(id) {
     try {
-      const response = await fetch(`${API_BASE}/api/videos/${id}/summary`);
+      const response = await apiFetch(`${API_BASE}/api/videos/${id}/summary`);
       if (response.ok) setOverview(await response.json());
     } catch {
       // The video remains usable if overview generation is unavailable.
@@ -350,7 +364,7 @@ function App() {
 
   async function loadTags(id) {
     try {
-      const response = await fetch(`${API_BASE}/api/videos/${id}/tags`);
+      const response = await apiFetch(`${API_BASE}/api/videos/${id}/tags`);
       if (response.ok && activeVideoIdRef.current === id) setVideoTags(await response.json());
     } catch {
       // Tags are optional organization metadata and do not block the video.
@@ -362,7 +376,7 @@ function App() {
     const tag = tagDraft.trim().toLowerCase();
     if (!videoId || !tag) return;
     try {
-      const response = await fetch(`${API_BASE}/api/videos/${videoId}/tags`, {
+      const response = await apiFetch(`${API_BASE}/api/videos/${videoId}/tags`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ tag })
@@ -380,7 +394,7 @@ function App() {
   async function removeTag(tag) {
     if (!videoId) return;
     try {
-      const response = await fetch(`${API_BASE}/api/videos/${videoId}/tags/${encodeURIComponent(tag)}`, { method: 'DELETE' });
+      const response = await apiFetch(`${API_BASE}/api/videos/${videoId}/tags/${encodeURIComponent(tag)}`, { method: 'DELETE' });
       if (!response.ok) throw new Error('Remove failed');
       setVideoTags(old => old.filter(item => item !== tag));
       setLibraryVideos(old => old.map(video => video.id === videoId ? { ...video, tags: (video.tags || []).filter(item => item !== tag) } : video));
@@ -392,7 +406,7 @@ function App() {
   async function loadAnalysis(id) {
     clearTimeout(analysisPollRef.current);
     try {
-      const response = await fetch(`${API_BASE}/api/videos/${id}/analysis`);
+      const response = await apiFetch(`${API_BASE}/api/videos/${id}/analysis`);
       if (!response.ok) return;
       const result = await response.json();
       if (activeVideoIdRef.current !== id) return;
@@ -421,7 +435,7 @@ function App() {
     setTranscriptLoading(true);
     try {
       const parameters = query.trim() ? `?q=${encodeURIComponent(query.trim())}` : '';
-      const response = await fetch(`${API_BASE}/api/videos/${id}/transcript${parameters}`);
+      const response = await apiFetch(`${API_BASE}/api/videos/${id}/transcript${parameters}`);
       if (!response.ok) return;
       const result = await response.json();
       if (activeVideoIdRef.current !== id) return;
@@ -444,7 +458,7 @@ function App() {
     if (!videoId) return;
     const method = segment.highlighted ? 'DELETE' : 'POST';
     try {
-      const response = await fetch(`${API_BASE}/api/videos/${videoId}/transcript/highlights/${segment.id}`, { method });
+      const response = await apiFetch(`${API_BASE}/api/videos/${videoId}/transcript/highlights/${segment.id}`, { method });
       if (!response.ok) throw new Error();
       setTranscriptSegments(items => items.map(item => item.id === segment.id ? { ...item, highlighted: !segment.highlighted } : item));
       setToast(segment.highlighted ? 'Highlight removed' : 'Quote highlighted');
@@ -455,7 +469,7 @@ function App() {
 
   async function loadAnnotations(id) {
     try {
-      const response = await fetch(`${API_BASE}/api/videos/${id}/annotations`);
+      const response = await apiFetch(`${API_BASE}/api/videos/${id}/annotations`);
       if (response.ok && activeVideoIdRef.current === id) setAnnotations(await response.json());
     } catch {
       // Annotations are optional and do not block the video workspace.
@@ -467,7 +481,7 @@ function App() {
     const note = annotationDraft.trim();
     if (!videoId || !note) return;
     try {
-      const response = await fetch(`${API_BASE}/api/videos/${videoId}/annotations`, {
+      const response = await apiFetch(`${API_BASE}/api/videos/${videoId}/annotations`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ timestamp: currentTime, note })
@@ -485,7 +499,7 @@ function App() {
   async function removeAnnotation(annotationId) {
     if (!videoId) return;
     try {
-      const response = await fetch(`${API_BASE}/api/videos/${videoId}/annotations/${annotationId}`, { method: 'DELETE' });
+      const response = await apiFetch(`${API_BASE}/api/videos/${videoId}/annotations/${annotationId}`, { method: 'DELETE' });
       if (!response.ok) throw new Error('Delete failed');
       setAnnotations(old => old.filter(item => item.id !== annotationId));
       setToast('Note removed');
@@ -497,7 +511,7 @@ function App() {
   async function shareCurrentMoment() {
     if (!videoId) return;
     try {
-      const response = await fetch(`${API_BASE}/api/videos/${videoId}/shares`, {
+      const response = await apiFetch(`${API_BASE}/api/videos/${videoId}/shares`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ timestamp: currentTime, expires_hours: 168 })
@@ -522,7 +536,7 @@ function App() {
     setTranscriptStatus('queued');
     setTranscriptError('');
     try {
-      const response = await fetch(`${API_BASE}/api/videos/${videoId}/transcript/retry`, { method: 'POST' });
+      const response = await apiFetch(`${API_BASE}/api/videos/${videoId}/transcript/retry`, { method: 'POST' });
       if (!response.ok) throw new Error('Retry failed');
       void loadTranscript(videoId, transcriptQuery);
     } catch {
@@ -538,7 +552,7 @@ function App() {
     setProgress(0);
     setProcessing(true);
     try {
-      const response = await fetch(`${API_BASE}/api/videos/${videoId}/analysis/retry`, { method: 'POST' });
+      const response = await apiFetch(`${API_BASE}/api/videos/${videoId}/analysis/retry`, { method: 'POST' });
       if (!response.ok) throw new Error('Retry failed');
       void loadAnalysis(videoId);
     } catch {
@@ -553,7 +567,7 @@ function App() {
     const name = editingName.trim();
     if (!name) return;
     try {
-      const response = await fetch(`${API_BASE}/api/videos/${videoId}`, {
+      const response = await apiFetch(`${API_BASE}/api/videos/${videoId}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name })
@@ -570,7 +584,7 @@ function App() {
 
   async function deleteStoredVideo(videoId) {
     try {
-      const response = await fetch(`${API_BASE}/api/videos/${videoId}`, { method: 'DELETE' });
+      const response = await apiFetch(`${API_BASE}/api/videos/${videoId}`, { method: 'DELETE' });
       if (!response.ok) throw new Error('Delete failed');
       setLibraryVideos(old => old.filter(video => video.id !== videoId));
       setPendingDeleteId('');
@@ -593,7 +607,7 @@ function App() {
   async function compareSelected() {
     if (compareSelection.length !== 2) return;
     try {
-      const response = await fetch(`${API_BASE}/api/compare`, {
+      const response = await apiFetch(`${API_BASE}/api/compare`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ video_ids: compareSelection })
@@ -613,9 +627,9 @@ function App() {
     openStoredVideo(video);
   }
 
-  function openStoredVideo(video, cacheBust = '') {
+  async function openStoredVideo(video, cacheBust = '') {
     if (videoUrl?.startsWith('blob:')) URL.revokeObjectURL(videoUrl);
-    setVideoUrl(`${API_BASE}/api/videos/${video.id}/content${cacheBust ? `?v=${cacheBust}` : ''}`);
+    setVideoUrl('');
     setVideoId(video.id);
     activeVideoIdRef.current = video.id;
     setSourceType(video.source_type || 'upload');
@@ -646,6 +660,15 @@ function App() {
     setProcessing(video.analysis_status === 'queued' || video.analysis_status === 'processing');
     setOverview({ summary: 'Loading the saved overview…', tags: [], generated: false });
     setPage('studio');
+    try {
+      const response = await apiFetch(`${API_BASE}/api/videos/${video.id}/content${cacheBust ? `?v=${cacheBust}` : ''}`);
+      if (!response.ok) throw new Error('Playback unavailable');
+      const objectUrl = URL.createObjectURL(await response.blob());
+      if (activeVideoIdRef.current === video.id) setVideoUrl(objectUrl);
+      else URL.revokeObjectURL(objectUrl);
+    } catch {
+      setPlaybackError(true);
+    }
     void loadOverview(video.id);
     void loadAnalysis(video.id);
     void loadConversations(video.id);
@@ -659,7 +682,7 @@ function App() {
     setRepairingImport(true);
     setToast('Repairing the web import…');
     try {
-      const response = await fetch(`${API_BASE}/api/videos/${videoId}/reimport`, { method: 'POST' });
+      const response = await apiFetch(`${API_BASE}/api/videos/${videoId}/reimport`, { method: 'POST' });
       const result = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(result.detail || 'The web import could not be repaired');
       setLibraryVideos(old => old.map(item => item.id === result.id ? { ...item, ...result } : item));
@@ -675,7 +698,7 @@ function App() {
   async function pollImport(importId) {
     clearTimeout(importPollRef.current);
     try {
-      const response = await fetch(`${API_BASE}/api/imports/${importId}`);
+      const response = await apiFetch(`${API_BASE}/api/imports/${importId}`);
       const result = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(result.detail || 'Import status is unavailable');
       setImportJob(result);
@@ -703,7 +726,7 @@ function App() {
   async function cancelImport() {
     if (!importJob?.id) return;
     try {
-      await fetch(`${API_BASE}/api/imports/${importJob.id}/cancel`, { method: 'POST' });
+      await apiFetch(`${API_BASE}/api/imports/${importJob.id}/cancel`, { method: 'POST' });
       setImportJob(old => old ? { ...old, status: 'cancelling', detail: 'Cancelling import' } : old);
       void pollImport(importJob.id);
     } catch {
@@ -715,7 +738,7 @@ function App() {
     if (!importJob?.id) return;
     setImportingUrl(true);
     try {
-      const response = await fetch(`${API_BASE}/api/imports/${importJob.id}/retry`, { method: 'POST' });
+      const response = await apiFetch(`${API_BASE}/api/imports/${importJob.id}/retry`, { method: 'POST' });
       const result = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(result.detail || 'Retry failed');
       setImportJob(result);
@@ -740,7 +763,7 @@ function App() {
     setImportingUrl(true);
     setToast('Importing the public video…');
     try {
-      const response = await fetch(`${API_BASE}/api/imports`, {
+      const response = await apiFetch(`${API_BASE}/api/imports`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: value })
@@ -764,7 +787,7 @@ function App() {
     const timeout = setTimeout(() => controller.abort(), 120000);
     let reachedApi = false;
     try {
-      const response = await fetch(`${API_BASE}/api/videos/upload`, { method: 'POST', body: form, signal: controller.signal });
+      const response = await apiFetch(`${API_BASE}/api/videos/upload`, { method: 'POST', body: form, signal: controller.signal });
       reachedApi = true;
       setApiOnline(true);
       if (!response.ok) {
@@ -851,7 +874,7 @@ function App() {
   async function loadDemo() {
     setToast('Loading the demo film…');
     try {
-      const response = await fetch(DEMO_VIDEO_PATH);
+      const response = await nativeFetch(DEMO_VIDEO_PATH);
       if (!response.ok) throw new Error('Demo unavailable');
       const blob = await response.blob();
       await loadFile(new File([blob], 'alpine-trail-demo.webm', { type: 'video/webm' }), { demo: true });
@@ -890,7 +913,7 @@ function App() {
     if (videoId) {
       try {
         let streamedConversationId = conversationId;
-        const response = await fetch(`${API_BASE}/api/chat/stream`, {
+        const response = await apiFetch(`${API_BASE}/api/chat/stream`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ video_id: videoId, message: question, conversation_id: conversationId || undefined })
         });
@@ -1060,6 +1083,41 @@ function App() {
     <input ref={fileRef} type="file" hidden accept="video/mp4,video/quicktime,video/webm,video/x-msvideo" onClick={e => { e.currentTarget.value = ''; }} onChange={e => { const selected = e.target.files?.[0]; if (selected) loadFile(selected); }} />
     {toast && <div className="toast"><Check size={14} />{toast}</div>}
   </div>;
+}
+
+function App() {
+  const [session, setSession] = useState(undefined);
+  const [email, setEmail] = useState('');
+  const [message, setMessage] = useState('');
+  const [sending, setSending] = useState(false);
+
+  useEffect(() => {
+    if (!supabase) {
+      setSession(null);
+      return undefined;
+    }
+    supabase.auth.getSession().then(({ data }) => setSession(data.session));
+    const { data } = supabase.auth.onAuthStateChange((_event, nextSession) => setSession(nextSession));
+    return () => data.subscription.unsubscribe();
+  }, []);
+
+  async function requestSignIn(event) {
+    event.preventDefault();
+    const address = email.trim();
+    if (!address || !supabase) return;
+    setSending(true);
+    setMessage('');
+    const { error } = await supabase.auth.signInWithOtp({
+      email: address,
+      options: { emailRedirectTo: window.location.origin }
+    });
+    setSending(false);
+    setMessage(error ? error.message : 'Check your email for the secure sign-in link.');
+  }
+
+  if (supabase && session === undefined) return <div className="auth-page"><Logo /><p>Opening your workspace…</p></div>;
+  if (supabase && !session) return <main className="auth-page"><Logo /><div className="auth-copy"><span>PRIVATE VIDEO WORKSPACE</span><h1>Sign in to your library.</h1><p>Your uploads, transcripts, notes, and conversations stay connected to your account.</p><form onSubmit={requestSignIn}><label htmlFor="sign-in-email">Email address</label><input id="sign-in-email" type="email" autoComplete="email" value={email} onChange={event => setEmail(event.target.value)} placeholder="you@example.com" required /><button type="submit" disabled={sending}>{sending ? 'Sending…' : 'Email me a sign-in link'} <ArrowRight size={14} /></button></form>{message && <p className="auth-message">{message}</p>}</div></main>;
+  return <><WorkspaceApp />{supabase && <button className="account-signout" onClick={() => supabase.auth.signOut()}>Sign out</button>}</>;
 }
 
 const rootElement = document.getElementById('root');

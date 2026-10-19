@@ -31,8 +31,12 @@ def main() -> None:
     require("REDIS_URL")
     require("OBJECT_STORAGE_BUCKET")
     require("OBJECT_STORAGE_ENDPOINT")
+    if require("OBJECT_STORAGE_PROVIDER") == "supabase":
+        require("SUPABASE_SERVICE_ROLE_KEY")
     require("OIDC_ISSUER_URL")
     require("OIDC_AUDIENCE")
+    if os.getenv("AUTH_MODE") != "required":
+        raise SystemExit("AUTH_MODE must be required in production")
     print("Production security configuration is valid")
 
 

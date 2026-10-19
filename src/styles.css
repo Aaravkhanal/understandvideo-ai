@@ -430,3 +430,24 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 @media (prefers-reduced-motion: reduce) {
   * { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
 }
+
+.auth-page { min-height: 100vh; padding: 38px clamp(24px, 7vw, 96px); display: flex; flex-direction: column; background: var(--paper); color: var(--ink); }
+.auth-page > .brand { align-self: flex-start; }
+.auth-copy { width: min(520px, 100%); margin: auto 0; padding: 72px 0; border-top: 1px solid var(--rule); border-bottom: 1px solid var(--rule); }
+.auth-copy > span { color: #777670; font-size: 9px; letter-spacing: .16em; }
+.auth-copy h1 { max-width: 470px; margin: 18px 0 14px; font-size: clamp(38px, 6vw, 72px); line-height: .98; letter-spacing: -.055em; font-weight: 500; }
+.auth-copy > p { max-width: 450px; color: #6f6e69; font-size: 13px; line-height: 1.7; }
+.auth-copy form { margin-top: 42px; display: grid; grid-template-columns: 1fr auto; gap: 12px 20px; align-items: end; }
+.auth-copy label { grid-column: 1 / -1; font-size: 9px; letter-spacing: .08em; }
+.auth-copy input { min-width: 0; padding: 12px 0; border: 0; border-bottom: 1px solid var(--ink); border-radius: 0; background: transparent; color: var(--ink); font: inherit; outline: none; }
+.auth-copy button, .account-signout { padding: 12px 0; border: 0; border-bottom: 1px solid var(--ink); background: transparent; color: var(--ink); display: inline-flex; align-items: center; gap: 8px; cursor: pointer; font-size: 10px; }
+.auth-copy button:hover, .account-signout:hover { opacity: .55; }
+.auth-copy button:disabled { opacity: .35; cursor: wait; }
+.auth-message { margin-top: 20px; color: var(--ink) !important; }
+.account-signout { position: fixed; z-index: 50; left: 28px; bottom: 25px; }
+
+@media (max-width: 680px) {
+  .auth-copy form { grid-template-columns: 1fr; }
+  .auth-copy button { justify-self: start; }
+  .account-signout { left: auto; right: 18px; bottom: 18px; }
+}

@@ -292,15 +292,19 @@ whose first folder is the authenticated user's id. The bucket must remain
 private, and production object names must follow
 `<user-id>/<video-id>/<filename>` for those policies to allow access.
 
-Real JWT enforcement in the FastAPI service, PostgreSQL/Redis persistence, and
-the server-side Supabase Storage adapter remain deliberate cutover tasks. Until
-those adapters land, the application continues to use its local identity,
-SQLite database, and filesystem media store. The configuration validator still
-requires the intended production connection settings so a deployment cannot be
-mistakenly presented as fully connected. Never expose the Supabase service-role
-key to Vite or commit it; inject it into the API/worker through the deployment
-secret manager. Generated playback links should expire after five minutes and
-storage lifecycle rules should match `DEFAULT_RETENTION_DAYS`.
+The React app now uses Supabase passwordless email sessions, sends the access
+token with API requests, and the FastAPI service verifies its signature,
+issuer, audience, and expiry against Supabase JWKS. Each authenticated user gets
+an isolated personal workspace. Set `AUTH_MODE=required` outside automated
+tests to reject anonymous private API requests.
+
+The server-side Supabase Storage adapter mirrors each validated original into
+`<user-id>/<video-id>/<filename>` while retaining a local working copy for
+FFmpeg, transcription, and frame extraction. Deletion and retention cleanup
+remove both copies. PostgreSQL/Redis persistence and signed cloud playback URLs
+remain separate production cutovers; local processing still requires durable
+worker-visible disk. Never expose `SUPABASE_SERVICE_ROLE_KEY` to Vite or commit
+it—inject it into the API/worker through the deployment secret manager.
 
 The browser reads public limits from `/api/config`, so UI labels and validation
 stay aligned with server configuration.

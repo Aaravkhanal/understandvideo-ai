@@ -19,6 +19,7 @@ import urllib.request
 import uuid
 from collections import Counter
 from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import AsyncIterator, Iterator
 
@@ -28,9 +29,10 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field, HttpUrl, field_validator
 
 from server.analysis import AnalysisError, extract_scene_thumbnails
+from server.auth import Identity, auth_mode, verify_bearer_token
 from server.inference import answer_video_question, inference_mode, is_demo_video
 from server.remote_import import RemoteImportCancelled, RemoteImportError, import_remote_video, platform_hosts, validate_public_https_url
-from server.storage import LocalStorage, StorageError
+from server.storage import LocalStorage, StorageError, SupabaseStorage
 from server.transcription import NoAudioTrack, TranscriptionError, TranscriptionUnavailable, transcribe_video
 
 
@@ -49,6 +51,7 @@ DEFAULT_RETENTION_DAYS = int(os.getenv("DEFAULT_RETENTION_DAYS", "90"))
 LOCAL_ACCOUNT_ID = os.getenv("LOCAL_ACCOUNT_ID", "local-account")
 ACTIVE_WORKSPACE_ID = os.getenv("LOCAL_WORKSPACE_ID", "local-workspace")
 LOCAL_WORKSPACE_NAME = os.getenv("LOCAL_WORKSPACE_NAME", "Personal workspace")
+request_identity: ContextVar[Identity | None] = ContextVar("request_identity", default=None)
 logger = logging.getLogger(__name__)
 
 if DEFAULT_RETENTION_DAYS not in {0, 30, 90, 365}:
@@ -70,6 +73,16 @@ request_metrics: Counter[str] = Counter()
 request_duration_ms = 0.0
 # Kept as a harmless compatibility surface for older local test fixtures.
 requests_by_identity: dict = {}
+
+
+def active_account_id() -> str:
+    identity = request_identity.get()
+    return identity.account_id if identity else LOCAL_ACCOUNT_ID
+
+
+def active_workspace_id() -> str:
+    identity = request_identity.get()
+    return identity.workspace_id if identity else ACTIVE_WORKSPACE_ID
 
 
 class ChatRequest(BaseModel):
@@ -217,6 +230,12 @@ def db() -> Iterator[sqlite3.Connection]:
 
 
 def storage() -> LocalStorage:
+    if os.getenv("OBJECT_STORAGE_PROVIDER", "").strip().lower() == "supabase":
+        service_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+        bucket = os.getenv("OBJECT_STORAGE_BUCKET", "").strip()
+        endpoint = os.getenv("OBJECT_STORAGE_ENDPOINT", "").strip()
+        if service_key and bucket and endpoint:
+            return SupabaseStorage(UPLOADS, endpoint, bucket, service_key)
     return LocalStorage(UPLOADS)
 
 
@@ -488,6 +507,8 @@ def initialize() -> None:
         )
         if "source_type" not in video_columns:
             connection.execute("ALTER TABLE videos ADD COLUMN source_type TEXT NOT NULL DEFAULT 'upload'")
+        if "storage_key" not in video_columns:
+            connection.execute("ALTER TABLE videos ADD COLUMN storage_key TEXT")
         if "source_url" not in video_columns:
             connection.execute("ALTER TABLE videos ADD COLUMN source_url TEXT")
         if "expires_at" not in video_columns:
@@ -566,6 +587,58 @@ def initialize() -> None:
         )
 
 
+def ensure_identity(identity: Identity) -> None:
+    now = int(time.time())
+    name = identity.display_name or identity.email or "User"
+    with db() as connection:
+        connection.execute(
+            """
+            INSERT INTO accounts (id, email, display_name, created_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+              email = COALESCE(excluded.email, accounts.email),
+              display_name = excluded.display_name
+            """,
+            (identity.account_id, identity.email, name, now),
+        )
+        connection.execute(
+            "INSERT OR IGNORE INTO workspaces (id, name, owner_account_id, created_at) VALUES (?, ?, ?, ?)",
+            (identity.workspace_id, "Personal workspace", identity.account_id, now),
+        )
+        connection.execute(
+            "INSERT OR IGNORE INTO workspace_members (workspace_id, account_id, role, created_at) VALUES (?, ?, 'owner', ?)",
+            (identity.workspace_id, identity.account_id, now),
+        )
+
+
+@app.middleware("http")
+async def authenticate_request(request: Request, call_next):
+    public_path = (
+        request.method == "OPTIONS"
+        or request.url.path in {"/api/health", "/api/config"}
+        or request.url.path.startswith("/api/shares/")
+    )
+    identity = None
+    if not public_path or request.headers.get("authorization"):
+        try:
+            identity = verify_bearer_token(request)
+        except HTTPException as exc:
+            return Response(
+                content=json.dumps({"detail": exc.detail}),
+                status_code=exc.status_code,
+                media_type="application/json",
+            )
+    if not identity and auth_mode() == "required" and not public_path:
+        return Response(content='{"detail":"Sign in is required"}', status_code=401, media_type="application/json")
+    token = request_identity.set(identity)
+    try:
+        if identity:
+            ensure_identity(identity)
+        return await call_next(request)
+    finally:
+        request_identity.reset(token)
+
+
 @app.on_event("startup")
 async def on_startup() -> None:
     initialize()
@@ -608,11 +681,11 @@ def enforce_rate_limit(action: str, limit: int = 50, window: int = 3600) -> int:
             ON CONFLICT(identity, action, window_start)
             DO UPDATE SET request_count = request_count + 1
             """,
-            (LOCAL_ACCOUNT_ID, action, window_start),
+            (active_account_id(), action, window_start),
         )
         count = connection.execute(
             "SELECT request_count FROM rate_limit_buckets WHERE identity = ? AND action = ? AND window_start = ?",
-            (LOCAL_ACCOUNT_ID, action, window_start),
+            (active_account_id(), action, window_start),
         ).fetchone()["request_count"]
         connection.execute("DELETE FROM rate_limit_buckets WHERE window_start < ?", (window_start - window * 2,))
     if count > limit:
@@ -633,8 +706,8 @@ def purge_expired_videos() -> int:
     now = int(time.time())
     with db() as connection:
         expired = connection.execute(
-            "SELECT id, path FROM videos WHERE workspace_id = ? AND expires_at IS NOT NULL AND expires_at <= ?",
-            (ACTIVE_WORKSPACE_ID, now),
+            "SELECT id, path, storage_key FROM videos WHERE workspace_id = ? AND expires_at IS NOT NULL AND expires_at <= ?",
+            (active_workspace_id(), now),
         ).fetchall()
     for video in expired:
         cancelled_video_ids.add(video["id"])
@@ -643,7 +716,7 @@ def purge_expired_videos() -> int:
             connection.execute("DELETE FROM conversations WHERE video_id = ?", (video["id"],))
             connection.execute("DELETE FROM videos WHERE id = ?", (video["id"],))
         try:
-            storage().delete_video(Path(video["path"]), video["id"])
+            storage().delete_video(Path(video["path"]), video["id"], video["storage_key"])
         except StorageError:
             logger.exception("Could not remove expired video files for %s", video["id"])
     return len(expired)
@@ -966,11 +1039,19 @@ def import_error_is_retryable(message: str) -> bool:
 def run_import_job(import_id: str) -> None:
     with db() as connection:
         job = connection.execute(
-            "SELECT * FROM import_jobs WHERE id = ? AND workspace_id = ?",
-            (import_id, ACTIVE_WORKSPACE_ID),
+            "SELECT * FROM import_jobs WHERE id = ?",
+            (import_id,),
         ).fetchone()
         if not job or job["status"] not in {"queued", "processing"}:
             return
+        owner = connection.execute(
+            "SELECT owner_account_id FROM workspaces WHERE id = ?",
+            (job["workspace_id"],),
+        ).fetchone()
+        if not owner:
+            raise RuntimeError("Import job workspace has no owner")
+        job_workspace_id = job["workspace_id"]
+        job_account_id = owner["owner_account_id"]
         if job["cancel_requested"]:
             connection.execute(
                 "UPDATE import_jobs SET status = 'cancelled', detail = 'Import cancelled', updated_at = ? WHERE id = ?",
@@ -1041,18 +1122,20 @@ def run_import_job(import_id: str) -> None:
         video_id = uuid.uuid4().hex
         size = media.path.stat().st_size
         created_at = int(time.time())
+        storage_key = storage().sync_video(media.path, job_account_id, video_id, media.mime_type)
         with db() as connection:
             connection.execute(
                 """
                 INSERT INTO videos
-                  (id, workspace_id, name, path, mime_type, size_bytes, duration, width, height, status, created_at, source_type, source_url, expires_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?, 'url', ?, ?)
+                  (id, workspace_id, name, path, storage_key, mime_type, size_bytes, duration, width, height, status, created_at, source_type, source_url, expires_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?, 'url', ?, ?)
                 """,
                 (
                     video_id,
-                    ACTIVE_WORKSPACE_ID,
+                    job_workspace_id,
                     media.title,
                     str(media.path),
+                    storage_key,
                     media.mime_type,
                     size,
                     metadata["duration"],
@@ -1101,10 +1184,7 @@ def run_import_job(import_id: str) -> None:
 
 def run_pending_import_jobs() -> None:
     with db() as connection:
-        pending = connection.execute(
-            "SELECT id FROM import_jobs WHERE workspace_id = ? AND status = 'queued' ORDER BY created_at",
-            (ACTIVE_WORKSPACE_ID,),
-        ).fetchall()
+        pending = connection.execute("SELECT id FROM import_jobs WHERE status = 'queued' ORDER BY created_at").fetchall()
     for job in pending:
         run_import_job(job["id"])
 
@@ -1137,7 +1217,7 @@ def video_record(video_id: str) -> sqlite3.Row:
     with db() as connection:
         record = connection.execute(
             "SELECT * FROM videos WHERE id = ? AND workspace_id = ?",
-            (video_id, ACTIVE_WORKSPACE_ID),
+            (video_id, active_workspace_id()),
         ).fetchone()
     if not record:
         raise HTTPException(status_code=404, detail="Video not found")
@@ -1190,7 +1270,7 @@ def public_config() -> dict:
         "transcription_provider": transcription_provider,
         "transcription_available": transcription_available,
         "speaker_diarization_enabled": transcription_provider == "local" and os.getenv("LOCAL_SPEAKER_DIARIZATION", "true").lower() not in {"0", "false", "off"},
-        "workspace": {"id": ACTIVE_WORKSPACE_ID, "name": LOCAL_WORKSPACE_NAME, "mode": "local-development"},
+        "workspace": {"id": active_workspace_id(), "name": LOCAL_WORKSPACE_NAME, "mode": "local-development"},
     }
 
 
@@ -1209,7 +1289,7 @@ def current_workspace() -> dict:
             WHERE workspaces.id = ?
             GROUP BY workspaces.id, workspace_members.role
             """,
-            (LOCAL_ACCOUNT_ID, ACTIVE_WORKSPACE_ID),
+            (active_account_id(), active_workspace_id()),
         ).fetchone()
     if not workspace:
         raise HTTPException(status_code=404, detail="Workspace not found")
@@ -1221,7 +1301,7 @@ def list_api_keys() -> list[dict]:
     with db() as connection:
         rows = connection.execute(
             "SELECT id, name, key_prefix, created_at, last_used_at, revoked_at FROM api_keys WHERE workspace_id = ? ORDER BY created_at DESC",
-            (ACTIVE_WORKSPACE_ID,),
+            (active_workspace_id(),),
         ).fetchall()
     return [dict(row) for row in rows]
 
@@ -1238,7 +1318,7 @@ def create_api_key(payload: ApiKeyCreateRequest) -> dict:
     with db() as connection:
         connection.execute(
             "INSERT INTO api_keys (id, workspace_id, name, key_prefix, key_hash, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (record["id"], ACTIVE_WORKSPACE_ID, record["name"], record["key_prefix"], hashlib.sha256(raw_key.encode()).hexdigest(), record["created_at"]),
+            (record["id"], active_workspace_id(), record["name"], record["key_prefix"], hashlib.sha256(raw_key.encode()).hexdigest(), record["created_at"]),
         )
     return {**record, "key": raw_key, "notice": "Copy this key now. It will not be shown again."}
 
@@ -1248,7 +1328,7 @@ def revoke_api_key(key_id: str) -> Response:
     with db() as connection:
         changed = connection.execute(
             "UPDATE api_keys SET revoked_at = ? WHERE id = ? AND workspace_id = ? AND revoked_at IS NULL",
-            (int(time.time()), key_id, ACTIVE_WORKSPACE_ID),
+            (int(time.time()), key_id, active_workspace_id()),
         )
     if changed.rowcount == 0:
         raise HTTPException(status_code=404, detail="Active API key not found")
@@ -1260,7 +1340,7 @@ def list_webhooks() -> list[dict]:
     with db() as connection:
         rows = connection.execute(
             "SELECT id, url, events, created_at, disabled_at FROM webhook_subscriptions WHERE workspace_id = ? ORDER BY created_at DESC",
-            (ACTIVE_WORKSPACE_ID,),
+            (active_workspace_id(),),
         ).fetchall()
     return [{**dict(row), "events": json.loads(row["events"])} for row in rows]
 
@@ -1275,7 +1355,7 @@ def create_webhook(payload: WebhookCreateRequest) -> dict:
     with db() as connection:
         connection.execute(
             "INSERT INTO webhook_subscriptions (id, workspace_id, url, events, signing_secret, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (webhook_id, ACTIVE_WORKSPACE_ID, url, json.dumps(payload.events), signing_secret, created_at),
+            (webhook_id, active_workspace_id(), url, json.dumps(payload.events), signing_secret, created_at),
         )
     return {"id": webhook_id, "url": url, "events": payload.events, "created_at": created_at, "signing_secret": signing_secret, "notice": "Copy the signing secret now. It will not be shown again."}
 
@@ -1285,7 +1365,7 @@ def test_webhook(webhook_id: str) -> dict:
     with db() as connection:
         hook = connection.execute(
             "SELECT url, signing_secret FROM webhook_subscriptions WHERE id = ? AND workspace_id = ? AND disabled_at IS NULL",
-            (webhook_id, ACTIVE_WORKSPACE_ID),
+            (webhook_id, active_workspace_id()),
         ).fetchone()
     if not hook:
         raise HTTPException(status_code=404, detail="Active webhook not found")
@@ -1306,7 +1386,7 @@ def disable_webhook(webhook_id: str) -> Response:
     with db() as connection:
         changed = connection.execute(
             "UPDATE webhook_subscriptions SET disabled_at = ? WHERE id = ? AND workspace_id = ? AND disabled_at IS NULL",
-            (int(time.time()), webhook_id, ACTIVE_WORKSPACE_ID),
+            (int(time.time()), webhook_id, active_workspace_id()),
         )
     if changed.rowcount == 0:
         raise HTTPException(status_code=404, detail="Active webhook not found")
@@ -1344,14 +1424,19 @@ async def upload_video(request: Request, background_tasks: BackgroundTasks, file
         raise
     source_type = "demo" if is_demo_video(target) else "upload"
     created_at = int(time.time())
+    try:
+        storage_key = None if source_type == "demo" else storage().sync_video(target, active_account_id(), video_id, mime)
+    except StorageError as exc:
+        target.unlink(missing_ok=True)
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     with db() as connection:
         connection.execute(
             """
             INSERT INTO videos
-              (id, workspace_id, name, path, mime_type, size_bytes, duration, width, height, status, created_at, source_type, source_url, expires_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              (id, workspace_id, name, path, storage_key, mime_type, size_bytes, duration, width, height, status, created_at, source_type, source_url, expires_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (video_id, ACTIVE_WORKSPACE_ID, file.filename or target.name, str(target), mime, size, metadata["duration"], metadata["width"], metadata["height"], "ready", created_at, source_type, None, None if source_type == "demo" else default_expiry(created_at)),
+            (video_id, active_workspace_id(), file.filename or target.name, str(target), storage_key, mime, size, metadata["duration"], metadata["width"], metadata["height"], "ready", created_at, source_type, None, None if source_type == "demo" else default_expiry(created_at)),
         )
         if source_type != "demo":
             queue_analysis(connection, video_id)
@@ -1398,14 +1483,19 @@ async def import_video_url(request: Request, background_tasks: BackgroundTasks, 
     metadata = probe_video(media.path)
     size = media.path.stat().st_size
     created_at = int(time.time())
+    try:
+        storage_key = storage().sync_video(media.path, active_account_id(), video_id, media.mime_type)
+    except StorageError as exc:
+        media.path.unlink(missing_ok=True)
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     with db() as connection:
         connection.execute(
             """
             INSERT INTO videos
-              (id, workspace_id, name, path, mime_type, size_bytes, duration, width, height, status, created_at, source_type, source_url, expires_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'url', ?, ?)
+              (id, workspace_id, name, path, storage_key, mime_type, size_bytes, duration, width, height, status, created_at, source_type, source_url, expires_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'url', ?, ?)
             """,
-            (video_id, ACTIVE_WORKSPACE_ID, media.title, str(media.path), media.mime_type, size, metadata["duration"], metadata["width"], metadata["height"], "ready", created_at, media.source_url, default_expiry(created_at)),
+            (video_id, active_workspace_id(), media.title, str(media.path), storage_key, media.mime_type, size, metadata["duration"], metadata["width"], metadata["height"], "ready", created_at, media.source_url, default_expiry(created_at)),
         )
         queue_analysis(connection, video_id)
         queue_transcript(connection, video_id)
@@ -1436,7 +1526,7 @@ def create_import_job(request: Request, background_tasks: BackgroundTasks, paylo
               (id, workspace_id, source_url, status, progress, detail, video_id, error, cancel_requested, created_at, updated_at)
             VALUES (?, ?, ?, 'queued', 0, 'Waiting to start', NULL, NULL, 0, ?, ?)
             """,
-            (import_id, ACTIVE_WORKSPACE_ID, str(payload.url), now, now),
+            (import_id, active_workspace_id(), str(payload.url), now, now),
         )
     background_tasks.add_task(run_import_job, import_id)
     return {"id": import_id, "status": "queued", "progress": 0, "detail": "Waiting to start"}
@@ -1453,7 +1543,7 @@ def list_import_jobs(active: bool = False, limit: int = Query(default=10, ge=1, 
                 WHERE workspace_id = ? AND status IN ('queued', 'processing')
                 ORDER BY created_at DESC LIMIT ?
                 """,
-                (ACTIVE_WORKSPACE_ID, limit),
+                (active_workspace_id(), limit),
             ).fetchall()
         else:
             records = connection.execute(
@@ -1461,7 +1551,7 @@ def list_import_jobs(active: bool = False, limit: int = Query(default=10, ge=1, 
                 SELECT id, source_url, status, progress, detail, video_id, error, created_at, updated_at
                 FROM import_jobs WHERE workspace_id = ? ORDER BY created_at DESC LIMIT ?
                 """,
-                (ACTIVE_WORKSPACE_ID, limit),
+                (active_workspace_id(), limit),
             ).fetchall()
     return [dict(record) for record in records]
 
@@ -1474,7 +1564,7 @@ def import_job(import_id: str) -> dict:
             SELECT id, source_url, status, progress, detail, video_id, error, created_at, updated_at
             FROM import_jobs WHERE id = ? AND workspace_id = ?
             """,
-            (import_id, ACTIVE_WORKSPACE_ID),
+            (import_id, active_workspace_id()),
         ).fetchone()
         if not job:
             raise HTTPException(status_code=404, detail="Import not found")
@@ -1489,7 +1579,7 @@ def import_job(import_id: str) -> dict:
                 FROM videos LEFT JOIN analysis_jobs ON analysis_jobs.video_id = videos.id
                 WHERE videos.id = ? AND videos.workspace_id = ?
                 """,
-                (job["video_id"], ACTIVE_WORKSPACE_ID),
+                (job["video_id"], active_workspace_id()),
             ).fetchone()
             result["video"] = dict(video) if video else None
     return result
@@ -1500,7 +1590,7 @@ def cancel_import_job(import_id: str) -> dict:
     with db() as connection:
         job = connection.execute(
             "SELECT status FROM import_jobs WHERE id = ? AND workspace_id = ?",
-            (import_id, ACTIVE_WORKSPACE_ID),
+            (import_id, active_workspace_id()),
         ).fetchone()
         if not job:
             raise HTTPException(status_code=404, detail="Import not found")
@@ -1519,7 +1609,7 @@ def retry_import_job(import_id: str, background_tasks: BackgroundTasks) -> dict:
     with db() as connection:
         job = connection.execute(
             "SELECT status FROM import_jobs WHERE id = ? AND workspace_id = ?",
-            (import_id, ACTIVE_WORKSPACE_ID),
+            (import_id, active_workspace_id()),
         ).fetchone()
         if not job:
             raise HTTPException(status_code=404, detail="Import not found")
@@ -1576,31 +1666,37 @@ async def reimport_video_url(video_id: str, background_tasks: BackgroundTasks) -
 
     old_path = Path(video["path"])
     size = media.path.stat().st_size
+    try:
+        storage_key = storage().sync_video(media.path, active_account_id(), video_id, media.mime_type)
+    except StorageError as exc:
+        media.path.unlink(missing_ok=True)
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     with db() as connection:
         connection.execute("DELETE FROM scenes WHERE video_id = ?", (video_id,))
         connection.execute("DELETE FROM transcript_segments WHERE video_id = ?", (video_id,))
         connection.execute(
             """
             UPDATE videos
-            SET name = ?, path = ?, mime_type = ?, size_bytes = ?, duration = ?, width = ?, height = ?, status = 'ready'
+            SET name = ?, path = ?, storage_key = ?, mime_type = ?, size_bytes = ?, duration = ?, width = ?, height = ?, status = 'ready'
             WHERE id = ? AND workspace_id = ?
             """,
             (
                 media.title,
                 str(media.path),
+                storage_key,
                 media.mime_type,
                 size,
                 metadata["duration"],
                 metadata["width"],
                 metadata["height"],
                 video_id,
-                ACTIVE_WORKSPACE_ID,
+                active_workspace_id(),
             ),
         )
         queue_analysis(connection, video_id)
         queue_transcript(connection, video_id)
     try:
-        storage().delete_video(old_path, video_id)
+        storage().delete_video(old_path, video_id, video["storage_key"])
     except StorageError:
         logger.warning("Could not remove the replaced media for video %s", video_id)
     for stale_download in UPLOADS.glob(f"{video_id}.*"):
@@ -1667,7 +1763,7 @@ def list_videos(q: str = Query(default="", max_length=200)) -> list[dict]:
               )
             ORDER BY videos.created_at DESC
             """,
-            (ACTIVE_WORKSPACE_ID, normalized_query, pattern, pattern, pattern, pattern, pattern, pattern),
+            (active_workspace_id(), normalized_query, pattern, pattern, pattern, pattern, pattern, pattern),
         ).fetchall()
     videos = []
     for record in records:
@@ -1686,7 +1782,7 @@ def rename_video(video_id: str, payload: RenameVideoRequest) -> dict:
     with db() as connection:
         connection.execute(
             "UPDATE videos SET name = ? WHERE id = ? AND workspace_id = ?",
-            (payload.name, video_id, ACTIVE_WORKSPACE_ID),
+            (payload.name, video_id, active_workspace_id()),
         )
     return {"id": video_id, "name": payload.name}
 
@@ -1698,7 +1794,7 @@ def set_video_retention(video_id: str, payload: RetentionRequest) -> dict:
     with db() as connection:
         connection.execute(
             "UPDATE videos SET expires_at = ? WHERE id = ? AND workspace_id = ?",
-            (expires_at, video_id, ACTIVE_WORKSPACE_ID),
+            (expires_at, video_id, active_workspace_id()),
         )
     return {"video_id": video_id, "retention_days": payload.days, "expires_at": expires_at}
 
@@ -1711,7 +1807,7 @@ def get_video_review(video_id: str) -> dict:
             "SELECT state, assignee, updated_by, updated_at FROM video_reviews WHERE video_id = ?",
             (video_id,),
         ).fetchone()
-    return dict(review) if review else {"state": "draft", "assignee": None, "updated_by": LOCAL_ACCOUNT_ID, "updated_at": None}
+    return dict(review) if review else {"state": "draft", "assignee": None, "updated_by": active_account_id(), "updated_at": None}
 
 
 @app.put("/api/videos/{video_id}/review")
@@ -1727,9 +1823,9 @@ def update_video_review(video_id: str, payload: ReviewUpdateRequest) -> dict:
             ON CONFLICT(video_id) DO UPDATE SET state = excluded.state, assignee = excluded.assignee,
               updated_by = excluded.updated_by, updated_at = excluded.updated_at
             """,
-            (video_id, payload.state, assignee, LOCAL_ACCOUNT_ID, now),
+            (video_id, payload.state, assignee, active_account_id(), now),
         )
-    return {"state": payload.state, "assignee": assignee, "updated_by": LOCAL_ACCOUNT_ID, "updated_at": now}
+    return {"state": payload.state, "assignee": assignee, "updated_by": active_account_id(), "updated_at": now}
 
 
 @app.get("/api/videos/{video_id}/comments")
@@ -1752,9 +1848,9 @@ def create_video_comment(video_id: str, payload: CommentCreateRequest) -> dict:
     with db() as connection:
         connection.execute(
             "INSERT INTO video_comments (id, video_id, account_id, body, timestamp, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (comment_id, video_id, LOCAL_ACCOUNT_ID, payload.body, timestamp, now),
+            (comment_id, video_id, active_account_id(), payload.body, timestamp, now),
         )
-    return {"id": comment_id, "account_id": LOCAL_ACCOUNT_ID, "body": payload.body, "timestamp": timestamp, "created_at": now}
+    return {"id": comment_id, "account_id": active_account_id(), "body": payload.body, "timestamp": timestamp, "created_at": now}
 
 
 @app.delete("/api/videos/{video_id}", status_code=204)
@@ -1772,7 +1868,7 @@ def delete_video(video_id: str) -> Response:
         connection.execute("DELETE FROM videos WHERE id = ?", (video_id,))
 
     try:
-        storage().delete_video(media_path, video_id)
+        storage().delete_video(media_path, video_id, video["storage_key"])
     except StorageError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     return Response(status_code=204)
@@ -1919,7 +2015,7 @@ def highlight_transcript_segment(video_id: str, segment_id: str) -> dict:
             raise HTTPException(status_code=404, detail="Transcript line not found")
         connection.execute(
             "INSERT OR IGNORE INTO transcript_highlights (id, video_id, segment_id, created_by, created_at) VALUES (?, ?, ?, ?, ?)",
-            (uuid.uuid4().hex, video_id, segment_id, LOCAL_ACCOUNT_ID, int(time.time())),
+            (uuid.uuid4().hex, video_id, segment_id, active_account_id(), int(time.time())),
         )
     return {**dict(segment), "highlighted": True}
 
@@ -1990,7 +2086,7 @@ def list_annotations(video_id: str) -> list[dict]:
             WHERE video_id = ? AND workspace_id = ?
             ORDER BY timestamp, created_at
             """,
-            (video_id, ACTIVE_WORKSPACE_ID),
+            (video_id, active_workspace_id()),
         ).fetchall()
     return [dict(record) for record in records]
 
@@ -2007,7 +2103,7 @@ def create_annotation(video_id: str, payload: AnnotationCreateRequest) -> dict:
             INSERT INTO annotations (id, video_id, workspace_id, account_id, timestamp, note, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (annotation_id, video_id, ACTIVE_WORKSPACE_ID, LOCAL_ACCOUNT_ID, timestamp, payload.note, created_at),
+            (annotation_id, video_id, active_workspace_id(), active_account_id(), timestamp, payload.note, created_at),
         )
     return {"id": annotation_id, "timestamp": timestamp, "note": payload.note, "created_at": created_at}
 
@@ -2018,7 +2114,7 @@ def delete_annotation(video_id: str, annotation_id: str) -> Response:
     with db() as connection:
         deleted = connection.execute(
             "DELETE FROM annotations WHERE id = ? AND video_id = ? AND workspace_id = ?",
-            (annotation_id, video_id, ACTIVE_WORKSPACE_ID),
+            (annotation_id, video_id, active_workspace_id()),
         )
     if deleted.rowcount == 0:
         raise HTTPException(status_code=404, detail="Annotation not found")
@@ -2035,7 +2131,7 @@ def export_video_notes(
     with db() as connection:
         annotations = [dict(row) for row in connection.execute(
             "SELECT timestamp, note, created_at FROM annotations WHERE video_id = ? AND workspace_id = ? ORDER BY timestamp",
-            (video_id, ACTIVE_WORKSPACE_ID),
+            (video_id, active_workspace_id()),
         ).fetchall()]
         transcript = [dict(row) for row in connection.execute(
             "SELECT start_seconds, end_seconds, text, speaker FROM transcript_segments WHERE video_id = ? ORDER BY position",
@@ -2120,7 +2216,7 @@ def create_share(video_id: str, payload: ShareCreateRequest) -> dict:
     with db() as connection:
         connection.execute(
             "INSERT INTO share_links (token, video_id, workspace_id, timestamp, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (token, video_id, ACTIVE_WORKSPACE_ID, timestamp, expires_at, now),
+            (token, video_id, active_workspace_id(), timestamp, expires_at, now),
         )
     return {"token": token, "timestamp": timestamp, "expires_at": expires_at, "share_path": f"/?share={token}"}
 
