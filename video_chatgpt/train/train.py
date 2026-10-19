@@ -360,7 +360,8 @@ class SupervisedDataset(Dataset):
                  tokenizer: transformers.PreTrainedTokenizer):
         super(SupervisedDataset, self).__init__()
         logging.warning("Loading data...")
-        list_data_dict = json.load(open(data_path, "r"))
+        with open(data_path, "r") as source:
+            list_data_dict = json.load(source)
 
         logging.warning("Formatting inputs...")
         sources = [example["conversations"] for example in list_data_dict]
@@ -402,10 +403,10 @@ class LazySupervisedDataset(Dataset):
         if 'video' in sources[0]:
             video_file = self.list_data_dict[i]['video']
             video_folder = self.multimodal_cfg['video_folder']
-            with open(f"{video_folder}/{video_file}", "rb") as f:
+            with (pathlib.Path(video_folder) / video_file).open("rb") as f:
                 features = pickle.load(f)
 
-            cur_token_len = 356  # 100 temporal + 256 spatial, TODO: Hard Coding is not good
+            cur_token_len = int(features.shape[0])
             sources = preprocess_multimodal(
                 copy.deepcopy([e["conversations"] for e in sources]),
                 self.multimodal_cfg, cur_token_len)

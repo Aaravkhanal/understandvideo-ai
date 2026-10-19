@@ -7,16 +7,25 @@
     "dev": "concurrently --kill-others --names web,api --prefix-colors green,cyan \"npm:dev:web\" \"npm:dev:api\"",
     "dev:web": "vite --host 127.0.0.1 --port 4310 --strictPort --open",
     "dev:api": "python3 -m uvicorn server.main:app --reload --host 127.0.0.1 --port 8787",
+    "dev:worker": "python3 -m uvicorn server.worker:app --reload --host 127.0.0.1 --port 8788",
+    "jobs": "python3 -m server.job_worker",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:api": "python3 -m unittest discover -s server/tests -v",
+    "test:web": "node --test src/*.test.js",
+    "check:python": "python3 -m compileall -q server scripts video_chatgpt data quantitative_evaluation",
+    "check": "npm run build && npm run test:web && npm run check:python && npm run test:api",
+    "test:e2e": "playwright test"
   },
   "dependencies": {
-    "@vitejs/plugin-react": "latest",
-    "concurrently": "latest",
-    "lucide-react": "latest",
-    "vite": "latest",
-    "react": "latest",
-    "react-dom": "latest"
+    "@vitejs/plugin-react": "6.1.2",
+    "concurrently": "10.0.6",
+    "lucide-react": "1.59.0",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "vite": "8.3.4"
   },
-  "devDependencies": {}
+  "devDependencies": {
+    "@playwright/test": "^1.56.1"
+  }
 }

@@ -1,6 +1,10 @@
-"""
-Usage:
-python TODO: Add usage
+"""Apply Video-ChatGPT delta weights to a compatible base model.
+
+Example:
+    python scripts/apply_delta.py \
+      --base-model-path /path/to/base-model \
+      --delta-path /path/to/delta-checkpoint \
+      --target-model-path /path/to/output-model
 """
 import argparse
 

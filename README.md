@@ -1,8 +1,8 @@
 <div align="center">
 
-# 🎬 understandvideo-ai
+# understandvideo
 
-**Next-Generation Multimodal Video Understanding & Conversational AI**
+**A focused workspace for asking grounded questions about video.**
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
 [![PyTorch 2.0+](https://img.shields.io/badge/PyTorch-2.0+-EE4C2C.svg?style=for-the-badge&logo=pytorch&logoColor=white)](https://pytorch.org/)
@@ -10,20 +10,18 @@
 [![Built by](https://img.shields.io/badge/Author-Aarav%20Khanal-10b981.svg?style=for-the-badge&logo=github&logoColor=white)](https://github.com/aaravkhanal)
 
 <p align="center">
-  <a href="#-key-features">Key Features</a> •
-  <a href="#-architecture">Architecture</a> •
-  <a href="#-quickstart">Quickstart</a> •
-  <a href="#-interactive-demo">Interactive Demo</a> •
-  <a href="#-benchmarks">Benchmarks</a> •
-  <a href="#-training">Training</a> •
-  <a href="#-license">License</a>
+  <a href="#current-product">Current product</a> •
+  <a href="#quickstart">Quickstart</a> •
+  <a href="#architecture">Architecture</a> •
+  <a href="#quality-checks">Quality checks</a> •
+  <a href="docs/IMPLEMENTATION_PLAN.md">Implementation plan</a>
 </p>
 
 ---
 
 </div>
 
-## 📌 Overview
+## Overview
 
 **understandvideo-ai** is an end-to-end multimodal conversational AI system built for deep video comprehension. By harmonizing spatiotemporal visual feature representations with large autoregressive language models, **understandvideo-ai** enables detailed video question answering, temporal reasoning, dense video summarization, and multi-turn conversational interactions about complex video scenes.
 
@@ -33,7 +31,90 @@
 
 ---
 
-## ✨ Key Features
+## Current product
+
+This repository contains two related layers:
+
+1. A modern React and FastAPI product workspace for uploading a video, navigating
+   its timeline, and asking timestamp-linked questions.
+2. The original Video-ChatGPT research, training, and evaluation code used for
+   local model development and benchmark reproduction.
+
+The included alpine film is a deterministic onboarding demo. Arbitrary uploads
+are never answered with the demo's facts: they require either `OPENAI_API_KEY`
+for sampled-frame vision inference or a future local inference worker. Without a
+configured model, the app keeps the video playable and says that analysis is not
+available instead of inventing an answer.
+
+### Working today
+
+- Premium responsive workspace with upload, playback, timeline navigation,
+  overview, library search, and streamed answers.
+- Public-link import for YouTube, Instagram, TikTok, Vimeo, X, Facebook,
+  Twitch, Reddit, Dailymotion, and direct HTTPS video files. Platform imports
+  preselect a browser-compatible MP4 within the configured size limit and
+  verify that the finished file contains a decodable video track.
+- Durable background link imports with real progress, cancellation, retry, and
+  automatic UI recovery after a browser refresh.
+- One-click repair for older failed link imports, preserving the library item
+  and original URL while replacing unusable media and rebuilding its timeline.
+- Durable local analysis jobs that detect strong visual cuts, fill sparse
+  timelines with neutral reference frames, and persist real thumbnails/posters
+  without inventing semantic labels.
+- Inline library rename and deliberate two-step deletion with cascading cleanup
+  of stored media, evidence frames, jobs, and conversation data.
+- Durable named conversations per video, including new-thread creation, history
+  reopening, automatic first-question titles, inline rename, and independent
+  thread deletion.
+- Optional timestamped speech transcription, persisted transcript segments,
+  automatic chapters, speaker-ready labels, quote highlights, full-text search,
+  click-to-seek results, retry state, and answer grounding.
+- Local account/workspace records with workspace-scoped video access and a
+  storage adapter ready for a future S3-compatible implementation.
+- Pluggable demo, cloud-vision, and HTTP worker inference adapters, plus a
+  separately runnable grounded-answer worker with storage-root and token checks.
+- Timestamped workspace notes, Markdown/JSON/premium HTML report exports,
+  expiring exact-moment links, downloadable 30-second clips, local review states,
+  assignments/comments, and side-by-side structural video comparison.
+- MP4, MOV, WebM, and AVI uploads with configurable size and hourly limits.
+- Container-signature and decoder validation that rejects non-video files even
+  when they use a supported filename or declared MIME type.
+- Optional ClamAV scanning, per-video retention expiry and permanent deletion,
+  durable account-scoped quotas, request IDs, timing metrics, and queue depth.
+- A standalone persisted job worker, desktop/mobile Playwright coverage, and a
+  CI workflow that runs build, unit, API, and browser checks.
+- Workspace search across video titles, source links, transcripts, notes, and
+  saved conversation messages, with user-managed searchable tags.
+- SQLite metadata and conversation persistence, scoped by video and conversation.
+- Optional OpenAI vision inference over uniformly sampled frames.
+- Honest browser-only fallback and a zero-setup included demo.
+- API regression tests for validation, limits, and conversation isolation.
+
+### Known limitations
+
+- Shot detection is visual-change based and intentionally falls back to neutral
+  reference frames; semantic chapter names still require a connected vision model.
+- Private, login-only, live, removed, DRM-protected, or extractor-incompatible
+  online videos cannot be imported.
+- Long online videos may be imported at a lower resolution so the combined
+  video and audio remain within `MAX_UPLOAD_BYTES`.
+- Accurate automatic speaker diarization still requires a diarization-capable
+  transcription provider or a local model; the database and UI already accept labels.
+- The included queue is durable and separately runnable but remains SQLite/local;
+  multi-machine execution needs PostgreSQL/Redis and object storage.
+- ClamAV scanning is enforced only when `MALWARE_SCAN_MODE=required`; true sandboxed
+  decoding still requires an isolated worker container with CPU/memory limits.
+- Production authentication, team invitations, semantic embeddings, automatic
+  webhook event fan-out, and PostgreSQL `DATABASE_URL` integration remain deployment work.
+  Local API-key lifecycle and signed webhook registration/test delivery are available.
+
+The prioritized work is tracked in the
+[implementation plan](docs/IMPLEMENTATION_PLAN.md) and
+[product roadmap](docs/PLATFORM_ROADMAP.md).
+
+---
+
+## Key features
 
 - **Spatiotemporal Visual Encoding**: Combines frame-level spatial feature extraction (CLIP ViT-L/14) with custom temporal pooling to model dynamic actions and continuous scenes.
 - **Context-Aware Conversational QA**: Retains conversational history across multiple turns, enabling detailed exploration of visual events, objects, actions, and intent.
@@ -44,7 +125,7 @@
 
 ---
 
-## 🏛️ Architecture
+## Architecture
 
 <p align="center">
   <img src="docs/images/hightlights_video_chatgpt.png" alt="understandvideo-ai System Highlights" width="90%" style="border-radius: 8px;">
@@ -56,67 +137,34 @@
 
 ---
 
-## 🚀 Quickstart
+## Quickstart
 
-### 1. Prerequisites & Environment Setup
-
-Ensure you have [Conda](https://docs.conda.io/en/latest/) and an NVIDIA GPU with at least 16GB VRAM (or compatible PyTorch setup).
+The web product does not require a GPU or model weights for the included demo.
+Use Node.js 20.19+ (or 22.12+) and Python 3.10+.
 
 ```bash
-# Clone the repository
 git clone https://github.com/Aaravkhanal/understandvideo-ai.git
 cd understandvideo-ai
 
-# Create and activate environment
-conda create -n understandvideo-ai python=3.10 -y
-conda activate understandvideo-ai
+npm install
+python -m venv .venv
+source .venv/bin/activate
+pip install -r server/requirements-dev.txt
 
-# Install dependencies
-pip install -r requirements.txt
-export PYTHONPATH="./:$PYTHONPATH"
+npm run dev
 ```
 
-### 2. Optional: FlashAttention Installation (Recommended for Training)
-```bash
-pip install ninja
-git clone https://github.com/HazyResearch/flash-attention.git
-cd flash-attention
-git checkout v1.0.7
-python setup.py install
-cd ..
-```
+The command opens the app at `http://localhost:4310` and starts its API
+on `http://localhost:8787`. These dedicated ports avoid collisions with other
+local projects. API documentation is available at `http://localhost:8787/docs`.
 
----
-
-## 💻 Interactive Demo
-
-### Modern workspace (recommended)
-
-The repository now includes a polished React workspace and a FastAPI service. The
-frontend runs in a self-contained demo mode out of the box, so video upload,
-playback, scene navigation, timestamp jumps, chat streaming, and history can be
-explored without downloading model weights.
+## Web workspace
 
 UnderstandVideo is a **video understanding and conversational Q&A platform**. It
 does not generate or edit videos. Users provide an existing video, then ask
 questions about its events, people, objects, setting, sequence, or meaning. Every
 answer should remain grounded in the uploaded video and link back to supporting
 timestamps whenever possible.
-
-```bash
-# Install the web and API dependencies once
-npm install
-python -m venv .venv
-source .venv/bin/activate
-pip install -r server/requirements.txt
-
-# Start the complete platform
-npm run dev
-```
-
-The command opens the correct app at `http://localhost:4310` and starts its API
-on `http://localhost:8787`. These dedicated ports avoid collisions with other
-local projects. API documentation is available at `http://localhost:8787/docs`.
 
 Use the **Try the 12 sec demo** action to explore the complete upload, analysis,
 scene map, timestamp navigation, overview, and conversational flow with the
@@ -138,6 +186,15 @@ frames with the question and recent conversation context. Without credentials,
 the included sample remains fully interactive and other uploads show a clear
 configuration message instead of returning invented answers.
 
+Paste a public video page or direct HTTPS media URL into **Analyze a public
+video link**. The API validates the destination, rejects local/private network
+addresses, selects H.264 video and AAC audio that fit together under the same
+size limit as uploads, verifies the result has a readable video track, stores
+the media, and makes it available through the same library, player, timeline,
+and chat workflow. If an older import is missing a playable track, use
+**Repair web import** in the studio. The importer never uses browser cookies or
+attempts to bypass access controls.
+
 The server defaults to `INFERENCE_MODE=demo`. Its summary and SSE chat endpoints
 are deliberately isolated behind `server/main.py`, providing a single integration
 point for either the local `video_chatgpt` inference code or a hosted multimodal
@@ -145,6 +202,105 @@ provider. Uploaded media and the local SQLite database are ignored by Git.
 
 See [Platform Roadmap](docs/PLATFORM_ROADMAP.md) for the prioritized path from
 this local foundation to a production SaaS release.
+
+### Configuration
+
+Copy `.env.example` values into your shell or preferred environment manager.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `OPENAI_API_KEY` | unset | Enables sampled-frame cloud vision inference. |
+| `OPENAI_VISION_MODEL` | `gpt-4.1-mini` | Vision-capable model used by the API. |
+| `OPENAI_REQUEST_TIMEOUT` | `60` | Cloud inference timeout in seconds. |
+| `OPENAI_TRANSCRIPTION_MODEL` | `whisper-1` | Model used for timestamped speech transcription. |
+| `OPENAI_TRANSCRIPTION_TIMEOUT` | `180` | Transcription request timeout in seconds. |
+| `LOCAL_ACCOUNT_ID` | `local-account` | Development account used before production authentication is connected. |
+| `LOCAL_WORKSPACE_ID` | `local-workspace` | Workspace boundary applied to local API reads and writes. |
+| `LOCAL_WORKSPACE_NAME` | `Personal workspace` | User-facing name for the local workspace record. |
+| `VIDEO_WORKER_URL` | unset | Optional dedicated answer worker URL, such as `http://127.0.0.1:8788`. |
+| `VIDEO_WORKER_TOKEN` | unset | Shared bearer token used between the API and answer worker. |
+| `VIDEO_WORKER_TIMEOUT` | `90` | Answer-worker request timeout in seconds. |
+| `WORKER_MEDIA_ROOT` | `server/uploads` | Filesystem root the dedicated worker is permitted to read. |
+| `MAX_UPLOAD_BYTES` | `104857600` | Maximum accepted upload size. |
+| `CHAT_REQUESTS_PER_HOUR` | `50` | Per-account chat request limit. |
+| `UPLOADS_PER_HOUR` | `20` | Per-account upload/import request limit. |
+| `MAX_REMOTE_DURATION_SECONDS` | `3600` | Longest permitted online video. |
+| `REMOTE_IMPORT_TIMEOUT_SECONDS` | `180` | Maximum time allowed for link import. |
+| `IMPORT_AUTO_RETRIES` | `2` | Automatic retries for temporary platform failures. |
+| `MALWARE_SCAN_MODE` | `optional` | Use ClamAV when present, require it, or disable scanning. |
+| `JOB_POLL_SECONDS` | `3` | Poll interval for the standalone durable job worker. |
+| `REMOTE_MEDIA_HOSTS` | unset | Optional comma-separated platform hosts added by the server owner. |
+| `CORS_ORIGINS` | local web URLs | Comma-separated browser origins allowed by the API. |
+| `VITE_API_URL` | same origin | Optional direct API base URL for the frontend. |
+
+The browser reads public limits from `/api/config`, so UI labels and validation
+stay aligned with server configuration.
+
+For process isolation, start `npm run dev:worker`, set `VIDEO_WORKER_URL` on the
+API process, and give both processes the same `VIDEO_WORKER_TOKEN`. The worker
+accepts media only from `WORKER_MEDIA_ROOT`; production deployment should place
+the API and worker on a private network and use the future object-storage adapter.
+
+### API surface
+
+| Method | Route | Purpose |
+| --- | --- | --- |
+| `GET` | `/api/health` | Health and inference mode. |
+| `GET` | `/api/metrics` | Request timing, response counts, and queue depth. |
+| `GET` | `/api/config` | Public upload and request limits. |
+| `GET` | `/api/workspace` | Read the active local workspace and stored-video count. |
+| `POST` | `/api/videos/upload` | Validate and persist a video. |
+| `POST` | `/api/videos/import-url` | Import a supported public video link. |
+| `GET/POST` | `/api/imports` | List or start durable background link imports. |
+| `GET` | `/api/imports/{id}` | Read import progress and its completed video. |
+| `POST` | `/api/imports/{id}/cancel` | Cancel a queued or active link import. |
+| `POST` | `/api/imports/{id}/retry` | Retry a stopped link import. |
+| `POST` | `/api/videos/{id}/reimport` | Repair a saved public-link import from its original URL. |
+| `GET` | `/api/videos` | List or search persisted videos and their saved evidence. |
+| `PATCH` | `/api/videos/{id}` | Rename a saved video. |
+| `DELETE` | `/api/videos/{id}` | Delete media and all locally derived data. |
+| `GET` | `/api/videos/{id}/content` | Stream stored media with byte-range support. |
+| `GET` | `/api/videos/{id}/analysis` | Read durable processing state, shot-aware moments, and detection provenance. |
+| `POST` | `/api/videos/{id}/analysis/retry` | Retry failed timeline extraction. |
+| `GET` | `/api/videos/{id}/scenes/{scene_id}/thumbnail` | Read a persisted evidence thumbnail. |
+| `GET` | `/api/videos/{id}/transcript` | Read or search timestamped transcript segments. |
+| `POST/DELETE` | `/api/videos/{id}/transcript/highlights/{segment_id}` | Save or remove a quote highlight. |
+| `POST` | `/api/videos/{id}/transcript/retry` | Retry failed or newly configured transcription. |
+| `GET/POST` | `/api/videos/{id}/tags` | List or add searchable library tags. |
+| `DELETE` | `/api/videos/{id}/tags/{tag}` | Remove a library tag. |
+| `GET/POST` | `/api/videos/{id}/annotations` | List or create timestamped workspace notes. |
+| `DELETE` | `/api/videos/{id}/annotations/{annotation_id}` | Remove a timestamped note. |
+| `GET` | `/api/videos/{id}/export` | Download Markdown, JSON, or styled HTML reports. |
+| `GET` | `/api/videos/{id}/clip` | Download a browser-compatible clip up to 120 seconds. |
+| `PATCH` | `/api/videos/{id}/retention` | Set or clear automatic permanent deletion. |
+| `GET/PUT` | `/api/videos/{id}/review` | Read or update review state and assignee. |
+| `GET/POST` | `/api/videos/{id}/comments` | Read or add team-ready review comments. |
+| `POST` | `/api/videos/{id}/shares` | Create an expiring exact-moment share link. |
+| `GET` | `/api/shares/{token}` | Open public metadata for an unexpired shared moment. |
+| `POST` | `/api/compare` | Compare two workspace videos and pair saved timeline moments. |
+| `GET/POST` | `/api/developer/api-keys` | List metadata or create a key shown only once. |
+| `DELETE` | `/api/developer/api-keys/{id}` | Revoke an API key. |
+| `GET/POST` | `/api/developer/webhooks` | List or register signed HTTPS webhooks. |
+| `POST` | `/api/developer/webhooks/{id}/test` | Send a signed test event. |
+| `GET` | `/api/videos/{id}/summary` | Demo overview or truthful analysis status. |
+| `POST` | `/api/chat/stream` | Stream a conversation-scoped answer over SSE. |
+| `GET/POST` | `/api/videos/{id}/conversations` | List or create durable video conversations. |
+| `PATCH` | `/api/videos/{id}/conversations/{conversation_id}` | Rename a conversation. |
+| `DELETE` | `/api/videos/{id}/conversations/{conversation_id}` | Delete one conversation and its messages. |
+| `GET` | `/api/videos/{id}/messages` | Read message history, optionally by conversation. |
+
+## Quality checks
+
+Install development dependencies and run the complete check:
+
+```bash
+pip install -r server/requirements-dev.txt
+npm run check
+```
+
+`npm run check` builds the production frontend, compiles the Python sources, and
+runs API regression tests. The browser interface is also manually verified at
+the local preview URL after visual changes.
 
 ### Legacy Gradio demo
 
@@ -212,6 +368,21 @@ For detailed offline preparation, see [Offline Demo Guide](docs/offline_demo.md)
 
 ## 🛠️ Training & Fine-Tuning
 
+The legacy research stack pins PyTorch, Transformers, Gradio, and Pydantic
+versions that intentionally differ from the modern FastAPI environment. Install
+it in a separate Conda environment; do not combine both requirement files in one
+environment.
+
+```bash
+conda create -n understandvideo-model python=3.10 -y
+conda activate understandvideo-model
+pip install -r requirements.txt
+export PYTHONPATH="./:$PYTHONPATH"
+```
+
+FlashAttention v1 is optional and should only be installed when reproducing the
+original CUDA training setup.
+
 To train or fine-tune **understandvideo-ai** across 8 GPUs using PyTorch Distributed / Torchrun:
 
 ```bash
@@ -270,8 +441,12 @@ For more documentation, see [Quantitative Evaluation Guide](quantitative_evaluat
 
 ```text
 understandvideo-ai/
+├── src/                          # React product workspace
+├── public/demo/                  # Included onboarding film and scene stills
+├── server/                       # FastAPI upload, persistence, and inference API
+│   └── tests/                    # API regression tests
 ├── data/                         # Instruction data generation & tooling
-├── docs/                         # Extended documentation & sample visual assets
+├── docs/                         # Plans, guides, and sample visual assets
 ├── quantitative_evaluation/      # Benchmarking scripts and evaluation tools
 ├── scripts/                      # Delta weight application and feature extraction
 ├── video_chatgpt/                # Core modeling, conversation engine & demo UI
@@ -279,7 +454,9 @@ understandvideo-ai/
 │   ├── eval/                     # Model inference runners
 │   ├── model/                    # PyTorch model definitions & projections
 │   └── train/                    # Distributed fine-tuning scripts
-├── requirements.txt              # Environment dependencies
+├── package.json                  # Web scripts and dependencies
+├── requirements.txt              # Legacy model dependencies
+├── .env.example                  # Supported runtime configuration
 ├── LICENSE                       # MIT License
 └── README.md                     # Project documentation
 ```

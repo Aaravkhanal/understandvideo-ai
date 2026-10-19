@@ -1,24 +1,36 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import html
+import hmac
 import json
+import logging
 import mimetypes
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
+import secrets
 import time
+import urllib.request
 import uuid
-from collections import defaultdict, deque
+from collections import Counter
+from contextlib import contextmanager
 from pathlib import Path
-from typing import AsyncIterator
+from typing import AsyncIterator, Iterator
 
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from fastapi.responses import FileResponse, Response, StreamingResponse
+from pydantic import BaseModel, Field, HttpUrl, field_validator
 
-from server.inference import answer_video_question, inference_mode
+from server.analysis import AnalysisError, extract_scene_thumbnails
+from server.inference import answer_video_question, inference_mode, is_demo_video
+from server.remote_import import RemoteImportCancelled, RemoteImportError, import_remote_video, platform_hosts, validate_public_https_url
+from server.storage import LocalStorage, StorageError
+from server.transcription import NoAudioTrack, TranscriptionError, TranscriptionUnavailable, transcribe_video
 
 
 ROOT = Path(__file__).resolve().parent
@@ -26,6 +38,16 @@ UPLOADS = ROOT / "uploads"
 DATABASE = ROOT / "understandvideo.db"
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", 100 * 1024 * 1024))
 ALLOWED_MIME = {"video/mp4", "video/quicktime", "video/webm", "video/x-msvideo"}
+CHAT_REQUESTS_PER_HOUR = int(os.getenv("CHAT_REQUESTS_PER_HOUR", "50"))
+UPLOADS_PER_HOUR = int(os.getenv("UPLOADS_PER_HOUR", "20"))
+MAX_REMOTE_DURATION_SECONDS = int(os.getenv("MAX_REMOTE_DURATION_SECONDS", "3600"))
+REMOTE_IMPORT_TIMEOUT_SECONDS = int(os.getenv("REMOTE_IMPORT_TIMEOUT_SECONDS", "180"))
+IMPORT_AUTO_RETRIES = int(os.getenv("IMPORT_AUTO_RETRIES", "2"))
+MALWARE_SCAN_MODE = os.getenv("MALWARE_SCAN_MODE", "optional").strip().lower()
+LOCAL_ACCOUNT_ID = os.getenv("LOCAL_ACCOUNT_ID", "local-account")
+ACTIVE_WORKSPACE_ID = os.getenv("LOCAL_WORKSPACE_ID", "local-workspace")
+LOCAL_WORKSPACE_NAME = os.getenv("LOCAL_WORKSPACE_NAME", "Personal workspace")
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="UnderstandVideo AI", version="0.1.0")
 app.add_middleware(
@@ -36,28 +58,193 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-requests_by_identity: dict[str, deque[float]] = defaultdict(deque)
+startup_tasks: set[asyncio.Task] = set()
+cancelled_video_ids: set[str] = set()
+cancelled_import_ids: set[str] = set()
+request_metrics: Counter[str] = Counter()
+request_duration_ms = 0.0
+# Kept as a harmless compatibility surface for older local test fixtures.
+requests_by_identity: dict = {}
 
 
 class ChatRequest(BaseModel):
     video_id: str
-    message: str
-    conversation_id: str | None = None
+    message: str = Field(min_length=1, max_length=4_000)
+    conversation_id: str | None = Field(default=None, max_length=64, pattern=r"^[a-zA-Z0-9_-]+$")
+
+    @field_validator("message")
+    @classmethod
+    def clean_message(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("Message cannot be blank")
+        return cleaned
 
 
-def db() -> sqlite3.Connection:
+class UrlImportRequest(BaseModel):
+    url: HttpUrl
+
+
+class RenameVideoRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=180)
+
+    @field_validator("name")
+    @classmethod
+    def clean_name(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("Name cannot be blank")
+        return cleaned
+
+
+class ConversationCreateRequest(BaseModel):
+    title: str = Field(default="New conversation", min_length=1, max_length=120)
+
+    @field_validator("title")
+    @classmethod
+    def clean_title(cls, value: str) -> str:
+        return value.strip() or "New conversation"
+
+
+class ConversationRenameRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=120)
+
+    @field_validator("title")
+    @classmethod
+    def clean_title(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("Title cannot be blank")
+        return cleaned
+
+
+class AnnotationCreateRequest(BaseModel):
+    timestamp: float = Field(ge=0, le=86_400)
+    note: str = Field(min_length=1, max_length=1_000)
+
+    @field_validator("note")
+    @classmethod
+    def clean_note(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("Annotation cannot be blank")
+        return cleaned
+
+
+class TagCreateRequest(BaseModel):
+    tag: str = Field(min_length=1, max_length=40)
+
+    @field_validator("tag")
+    @classmethod
+    def clean_tag(cls, value: str) -> str:
+        cleaned = re.sub(r"\s+", " ", value.strip().lower())
+        if not cleaned:
+            raise ValueError("Tag cannot be blank")
+        return cleaned
+
+
+class ShareCreateRequest(BaseModel):
+    timestamp: float = Field(default=0, ge=0, le=86_400)
+    expires_hours: int = Field(default=168, ge=1, le=720)
+
+
+class CompareVideosRequest(BaseModel):
+    video_ids: list[str] = Field(min_length=2, max_length=2)
+
+    @field_validator("video_ids")
+    @classmethod
+    def distinct_videos(cls, value: list[str]) -> list[str]:
+        if len(set(value)) != 2:
+            raise ValueError("Choose two different videos")
+        return value
+
+
+class RetentionRequest(BaseModel):
+    days: int | None = Field(default=None, ge=1, le=3650)
+
+
+class ReviewUpdateRequest(BaseModel):
+    state: str = Field(pattern="^(draft|in_review|approved|changes_requested)$")
+    assignee: str | None = Field(default=None, max_length=120)
+
+
+class CommentCreateRequest(BaseModel):
+    body: str = Field(min_length=1, max_length=2000)
+    timestamp: float | None = Field(default=None, ge=0, le=86400)
+
+    @field_validator("body")
+    @classmethod
+    def clean_body(cls, value: str) -> str:
+        return value.strip()
+
+
+class ApiKeyCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+
+
+class WebhookCreateRequest(BaseModel):
+    url: HttpUrl
+    events: list[str] = Field(min_length=1, max_length=10)
+
+    @field_validator("events")
+    @classmethod
+    def supported_events(cls, value: list[str]) -> list[str]:
+        allowed = {"video.ready", "import.failed", "review.updated"}
+        normalized = sorted(set(value))
+        if not set(normalized).issubset(allowed):
+            raise ValueError("Unsupported webhook event")
+        return normalized
+
+
+@contextmanager
+def db() -> Iterator[sqlite3.Connection]:
     connection = sqlite3.connect(DATABASE)
     connection.row_factory = sqlite3.Row
-    return connection
+    connection.execute("PRAGMA foreign_keys = ON")
+    try:
+        yield connection
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def storage() -> LocalStorage:
+    return LocalStorage(UPLOADS)
 
 
 def initialize() -> None:
-    UPLOADS.mkdir(parents=True, exist_ok=True)
+    storage().ensure_ready()
     with db() as connection:
         connection.executescript(
             """
+            CREATE TABLE IF NOT EXISTS accounts (
+              id TEXT PRIMARY KEY,
+              email TEXT,
+              display_name TEXT NOT NULL,
+              created_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS workspaces (
+              id TEXT PRIMARY KEY,
+              name TEXT NOT NULL,
+              owner_account_id TEXT NOT NULL,
+              created_at INTEGER NOT NULL,
+              FOREIGN KEY (owner_account_id) REFERENCES accounts(id)
+            );
+            CREATE TABLE IF NOT EXISTS workspace_members (
+              workspace_id TEXT NOT NULL,
+              account_id TEXT NOT NULL,
+              role TEXT NOT NULL,
+              created_at INTEGER NOT NULL,
+              PRIMARY KEY (workspace_id, account_id),
+              FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE,
+              FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
+            );
             CREATE TABLE IF NOT EXISTS videos (
               id TEXT PRIMARY KEY,
+              workspace_id TEXT NOT NULL DEFAULT 'local-workspace',
               name TEXT NOT NULL,
               path TEXT NOT NULL,
               mime_type TEXT NOT NULL,
@@ -66,7 +253,10 @@ def initialize() -> None:
               width INTEGER,
               height INTEGER,
               status TEXT NOT NULL,
-              created_at INTEGER NOT NULL
+              created_at INTEGER NOT NULL,
+              source_type TEXT NOT NULL DEFAULT 'upload',
+              source_url TEXT,
+              FOREIGN KEY (workspace_id) REFERENCES workspaces(id)
             );
             CREATE TABLE IF NOT EXISTS messages (
               id TEXT PRIMARY KEY,
@@ -76,29 +266,464 @@ def initialize() -> None:
               content TEXT NOT NULL,
               created_at INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS conversations (
+              id TEXT PRIMARY KEY,
+              video_id TEXT NOT NULL,
+              title TEXT NOT NULL,
+              created_at INTEGER NOT NULL,
+              updated_at INTEGER NOT NULL,
+              FOREIGN KEY (video_id) REFERENCES videos(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS analysis_jobs (
+              id TEXT PRIMARY KEY,
+              video_id TEXT NOT NULL UNIQUE,
+              status TEXT NOT NULL,
+              progress INTEGER NOT NULL DEFAULT 0,
+              error TEXT,
+              attempts INTEGER NOT NULL DEFAULT 0,
+              created_at INTEGER NOT NULL,
+              updated_at INTEGER NOT NULL,
+              FOREIGN KEY (video_id) REFERENCES videos(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS scenes (
+              id TEXT PRIMARY KEY,
+              video_id TEXT NOT NULL,
+              position INTEGER NOT NULL,
+              start_seconds REAL NOT NULL,
+              end_seconds REAL NOT NULL,
+              label TEXT NOT NULL,
+              thumbnail_path TEXT NOT NULL,
+              detection_method TEXT NOT NULL DEFAULT 'uniform-reference',
+              created_at INTEGER NOT NULL,
+              FOREIGN KEY (video_id) REFERENCES videos(id) ON DELETE CASCADE,
+              UNIQUE(video_id, position)
+            );
+            CREATE TABLE IF NOT EXISTS transcript_jobs (
+              id TEXT PRIMARY KEY,
+              video_id TEXT NOT NULL UNIQUE,
+              status TEXT NOT NULL,
+              error TEXT,
+              attempts INTEGER NOT NULL DEFAULT 0,
+              created_at INTEGER NOT NULL,
+              updated_at INTEGER NOT NULL,
+              FOREIGN KEY (video_id) REFERENCES videos(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS transcript_segments (
+              id TEXT PRIMARY KEY,
+              video_id TEXT NOT NULL,
+              position INTEGER NOT NULL,
+              start_seconds REAL NOT NULL,
+              end_seconds REAL NOT NULL,
+              text TEXT NOT NULL,
+              speaker TEXT,
+              created_at INTEGER NOT NULL,
+              FOREIGN KEY (video_id) REFERENCES videos(id) ON DELETE CASCADE,
+              UNIQUE(video_id, position)
+            );
+            CREATE TABLE IF NOT EXISTS transcript_chapters (
+              id TEXT PRIMARY KEY,
+              video_id TEXT NOT NULL,
+              position INTEGER NOT NULL,
+              start_seconds REAL NOT NULL,
+              end_seconds REAL NOT NULL,
+              title TEXT NOT NULL,
+              summary TEXT NOT NULL,
+              created_at INTEGER NOT NULL,
+              FOREIGN KEY (video_id) REFERENCES videos(id) ON DELETE CASCADE,
+              UNIQUE(video_id, position)
+            );
+            CREATE TABLE IF NOT EXISTS transcript_highlights (
+              id TEXT PRIMARY KEY,
+              video_id TEXT NOT NULL,
+              segment_id TEXT NOT NULL,
+              created_by TEXT NOT NULL,
+              created_at INTEGER NOT NULL,
+              FOREIGN KEY (video_id) REFERENCES videos(id) ON DELETE CASCADE,
+              FOREIGN KEY (segment_id) REFERENCES transcript_segments(id) ON DELETE CASCADE,
+              UNIQUE(video_id, segment_id)
+            );
+            CREATE TABLE IF NOT EXISTS annotations (
+              id TEXT PRIMARY KEY,
+              video_id TEXT NOT NULL,
+              workspace_id TEXT NOT NULL,
+              account_id TEXT NOT NULL,
+              timestamp REAL NOT NULL,
+              note TEXT NOT NULL,
+              created_at INTEGER NOT NULL,
+              FOREIGN KEY (video_id) REFERENCES videos(id) ON DELETE CASCADE,
+              FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE,
+              FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS video_tags (
+              video_id TEXT NOT NULL,
+              tag TEXT NOT NULL,
+              created_at INTEGER NOT NULL,
+              PRIMARY KEY (video_id, tag),
+              FOREIGN KEY (video_id) REFERENCES videos(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS share_links (
+              token TEXT PRIMARY KEY,
+              video_id TEXT NOT NULL,
+              workspace_id TEXT NOT NULL,
+              timestamp REAL NOT NULL,
+              expires_at INTEGER NOT NULL,
+              created_at INTEGER NOT NULL,
+              FOREIGN KEY (video_id) REFERENCES videos(id) ON DELETE CASCADE,
+              FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS import_jobs (
+              id TEXT PRIMARY KEY,
+              workspace_id TEXT NOT NULL,
+              source_url TEXT NOT NULL,
+              status TEXT NOT NULL,
+              progress INTEGER NOT NULL DEFAULT 0,
+              detail TEXT,
+              video_id TEXT,
+              error TEXT,
+              cancel_requested INTEGER NOT NULL DEFAULT 0,
+              attempts INTEGER NOT NULL DEFAULT 0,
+              created_at INTEGER NOT NULL,
+              updated_at INTEGER NOT NULL,
+              FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE,
+              FOREIGN KEY (video_id) REFERENCES videos(id) ON DELETE SET NULL
+            );
+            CREATE TABLE IF NOT EXISTS rate_limit_buckets (
+              identity TEXT NOT NULL,
+              action TEXT NOT NULL,
+              window_start INTEGER NOT NULL,
+              request_count INTEGER NOT NULL DEFAULT 0,
+              PRIMARY KEY (identity, action, window_start)
+            );
+            CREATE TABLE IF NOT EXISTS video_reviews (
+              video_id TEXT PRIMARY KEY,
+              state TEXT NOT NULL DEFAULT 'draft',
+              assignee TEXT,
+              updated_by TEXT NOT NULL,
+              updated_at INTEGER NOT NULL,
+              FOREIGN KEY (video_id) REFERENCES videos(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS video_comments (
+              id TEXT PRIMARY KEY,
+              video_id TEXT NOT NULL,
+              account_id TEXT NOT NULL,
+              body TEXT NOT NULL,
+              timestamp REAL,
+              created_at INTEGER NOT NULL,
+              FOREIGN KEY (video_id) REFERENCES videos(id) ON DELETE CASCADE,
+              FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS api_keys (
+              id TEXT PRIMARY KEY,
+              workspace_id TEXT NOT NULL,
+              name TEXT NOT NULL,
+              key_prefix TEXT NOT NULL,
+              key_hash TEXT NOT NULL UNIQUE,
+              created_at INTEGER NOT NULL,
+              last_used_at INTEGER,
+              revoked_at INTEGER,
+              FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS webhook_subscriptions (
+              id TEXT PRIMARY KEY,
+              workspace_id TEXT NOT NULL,
+              url TEXT NOT NULL,
+              events TEXT NOT NULL,
+              signing_secret TEXT NOT NULL,
+              created_at INTEGER NOT NULL,
+              disabled_at INTEGER,
+              FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_messages_video_conversation_created
+              ON messages(video_id, conversation_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_conversations_video_updated
+              ON conversations(video_id, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_videos_created_at
+              ON videos(created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_scenes_video_position
+              ON scenes(video_id, position);
+            CREATE INDEX IF NOT EXISTS idx_transcript_segments_video_position
+              ON transcript_segments(video_id, position);
+            CREATE INDEX IF NOT EXISTS idx_transcript_chapters_video_position
+              ON transcript_chapters(video_id, position);
+            CREATE INDEX IF NOT EXISTS idx_video_comments_video_created
+              ON video_comments(video_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_annotations_video_time
+              ON annotations(video_id, timestamp, created_at);
+            CREATE INDEX IF NOT EXISTS idx_video_tags_tag
+              ON video_tags(tag, video_id);
+            CREATE INDEX IF NOT EXISTS idx_share_links_video
+              ON share_links(video_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_import_jobs_workspace_created
+              ON import_jobs(workspace_id, created_at DESC);
             """
+        )
+        now = int(time.time())
+        connection.execute(
+            "INSERT OR IGNORE INTO accounts (id, email, display_name, created_at) VALUES (?, NULL, ?, ?)",
+            (LOCAL_ACCOUNT_ID, "Local user", now),
+        )
+        connection.execute(
+            "INSERT OR IGNORE INTO workspaces (id, name, owner_account_id, created_at) VALUES (?, ?, ?, ?)",
+            (ACTIVE_WORKSPACE_ID, LOCAL_WORKSPACE_NAME, LOCAL_ACCOUNT_ID, now),
+        )
+        connection.execute(
+            "INSERT OR IGNORE INTO workspace_members (workspace_id, account_id, role, created_at) VALUES (?, ?, 'owner', ?)",
+            (ACTIVE_WORKSPACE_ID, LOCAL_ACCOUNT_ID, now),
+        )
+        video_columns = {row["name"] for row in connection.execute("PRAGMA table_info(videos)")}
+        if "workspace_id" not in video_columns:
+            connection.execute("ALTER TABLE videos ADD COLUMN workspace_id TEXT NOT NULL DEFAULT 'local-workspace'")
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_videos_workspace_created ON videos(workspace_id, created_at DESC)"
+        )
+        connection.execute(
+            "UPDATE videos SET workspace_id = ? WHERE workspace_id IS NULL OR workspace_id = '' OR workspace_id = 'local-workspace'",
+            (ACTIVE_WORKSPACE_ID,),
+        )
+        if "source_type" not in video_columns:
+            connection.execute("ALTER TABLE videos ADD COLUMN source_type TEXT NOT NULL DEFAULT 'upload'")
+        if "source_url" not in video_columns:
+            connection.execute("ALTER TABLE videos ADD COLUMN source_url TEXT")
+        if "expires_at" not in video_columns:
+            connection.execute("ALTER TABLE videos ADD COLUMN expires_at INTEGER")
+        transcript_columns = {row["name"] for row in connection.execute("PRAGMA table_info(transcript_segments)")}
+        if "speaker" not in transcript_columns:
+            connection.execute("ALTER TABLE transcript_segments ADD COLUMN speaker TEXT")
+        import_columns = {row["name"] for row in connection.execute("PRAGMA table_info(import_jobs)")}
+        if "attempts" not in import_columns:
+            connection.execute("ALTER TABLE import_jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
+        scene_columns = {row["name"] for row in connection.execute("PRAGMA table_info(scenes)")}
+        if "detection_method" not in scene_columns:
+            connection.execute("ALTER TABLE scenes ADD COLUMN detection_method TEXT NOT NULL DEFAULT 'uniform-reference'")
+        migrated_uploads = connection.execute(
+            "SELECT id, path FROM videos WHERE source_type = 'upload' AND source_url IS NULL"
+        ).fetchall()
+        for record in migrated_uploads:
+            if is_demo_video(Path(record["path"])):
+                connection.execute("UPDATE videos SET source_type = 'demo' WHERE id = ?", (record["id"],))
+        legacy_conversations = connection.execute(
+            """
+            SELECT video_id, conversation_id, MIN(created_at) AS created_at, MAX(created_at) AS updated_at
+            FROM messages GROUP BY video_id, conversation_id
+            """
+        ).fetchall()
+        for legacy in legacy_conversations:
+            first_message = connection.execute(
+                """
+                SELECT content FROM messages
+                WHERE video_id = ? AND conversation_id = ? AND role = 'user'
+                ORDER BY created_at, rowid LIMIT 1
+                """,
+                (legacy["video_id"], legacy["conversation_id"]),
+            ).fetchone()
+            title = (first_message["content"] if first_message else "Conversation").strip()[:120] or "Conversation"
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO conversations (id, video_id, title, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (legacy["conversation_id"], legacy["video_id"], title, legacy["created_at"], legacy["updated_at"]),
+            )
+        connection.execute(
+            """
+            UPDATE analysis_jobs
+            SET status = 'queued', progress = 0, error = NULL, updated_at = ?
+            WHERE video_id IN (
+              SELECT DISTINCT video_id FROM scenes
+              WHERE detection_method = 'uniform-reference'
+            )
+            """,
+            (now,),
+        )
+        connection.execute("UPDATE analysis_jobs SET status = 'queued', progress = 0 WHERE status = 'processing'")
+        connection.execute(
+            """
+            INSERT INTO analysis_jobs (id, video_id, status, progress, error, attempts, created_at, updated_at)
+            SELECT lower(hex(randomblob(16))), videos.id, 'queued', 0, NULL, 0, ?, ?
+            FROM videos LEFT JOIN analysis_jobs ON analysis_jobs.video_id = videos.id
+            WHERE analysis_jobs.video_id IS NULL AND videos.source_type != 'demo'
+            """,
+            (now, now),
+        )
+        connection.execute(
+            """
+            INSERT INTO transcript_jobs (id, video_id, status, error, attempts, created_at, updated_at)
+            SELECT lower(hex(randomblob(16))), videos.id, 'queued', NULL, 0, ?, ?
+            FROM videos LEFT JOIN transcript_jobs ON transcript_jobs.video_id = videos.id
+            WHERE transcript_jobs.video_id IS NULL AND videos.source_type != 'demo'
+            """,
+            (now, now),
+        )
+        connection.execute("UPDATE transcript_jobs SET status = 'queued' WHERE status = 'processing'")
+        connection.execute(
+            "UPDATE import_jobs SET status = 'queued', progress = MIN(progress, 5), error = NULL WHERE status = 'processing'"
         )
 
 
 @app.on_event("startup")
-def on_startup() -> None:
+async def on_startup() -> None:
     initialize()
+    purge_expired_videos()
+    import_task = asyncio.create_task(asyncio.to_thread(run_pending_import_jobs))
+    startup_tasks.add(import_task)
+    import_task.add_done_callback(startup_tasks.discard)
+    task = asyncio.create_task(asyncio.to_thread(run_pending_analysis_jobs))
+    startup_tasks.add(task)
+    task.add_done_callback(startup_tasks.discard)
 
 
-def enforce_rate_limit(identity: str, limit: int = 50, window: int = 3600) -> int:
-    now = time.time()
-    bucket = requests_by_identity[identity]
-    while bucket and bucket[0] <= now - window:
-        bucket.popleft()
-    if len(bucket) >= limit:
-        raise HTTPException(status_code=429, detail="Hourly request limit reached")
-    bucket.append(now)
-    return limit - len(bucket)
+@app.middleware("http")
+async def observe_requests(request: Request, call_next):
+    global request_duration_ms
+    started = time.perf_counter()
+    request_id = request.headers.get("x-request-id") or uuid.uuid4().hex
+    try:
+        response = await call_next(request)
+    except Exception:
+        request_metrics["status_5xx"] += 1
+        raise
+    elapsed = (time.perf_counter() - started) * 1000
+    request_duration_ms += elapsed
+    request_metrics["requests"] += 1
+    request_metrics[f"status_{response.status_code // 100}xx"] += 1
+    response.headers["X-Request-ID"] = request_id
+    response.headers["Server-Timing"] = f"app;dur={elapsed:.1f}"
+    return response
+
+
+def enforce_rate_limit(action: str, limit: int = 50, window: int = 3600) -> int:
+    now = int(time.time())
+    window_start = now - (now % window)
+    with db() as connection:
+        connection.execute(
+            """
+            INSERT INTO rate_limit_buckets (identity, action, window_start, request_count)
+            VALUES (?, ?, ?, 1)
+            ON CONFLICT(identity, action, window_start)
+            DO UPDATE SET request_count = request_count + 1
+            """,
+            (LOCAL_ACCOUNT_ID, action, window_start),
+        )
+        count = connection.execute(
+            "SELECT request_count FROM rate_limit_buckets WHERE identity = ? AND action = ? AND window_start = ?",
+            (LOCAL_ACCOUNT_ID, action, window_start),
+        ).fetchone()["request_count"]
+        connection.execute("DELETE FROM rate_limit_buckets WHERE window_start < ?", (window_start - window * 2,))
+    if count > limit:
+        raise HTTPException(status_code=429, detail="This account has reached its hourly request limit")
+    return max(0, limit - count)
 
 
 def safe_name(name: str) -> str:
     stem = re.sub(r"[^a-zA-Z0-9._-]", "-", Path(name).name)
     return stem[:120] or "video.mp4"
+
+
+def purge_expired_videos() -> int:
+    now = int(time.time())
+    with db() as connection:
+        expired = connection.execute(
+            "SELECT id, path FROM videos WHERE workspace_id = ? AND expires_at IS NOT NULL AND expires_at <= ?",
+            (ACTIVE_WORKSPACE_ID, now),
+        ).fetchall()
+    for video in expired:
+        cancelled_video_ids.add(video["id"])
+        with db() as connection:
+            connection.execute("DELETE FROM messages WHERE video_id = ?", (video["id"],))
+            connection.execute("DELETE FROM conversations WHERE video_id = ?", (video["id"],))
+            connection.execute("DELETE FROM videos WHERE id = ?", (video["id"],))
+        try:
+            storage().delete_video(Path(video["path"]), video["id"])
+        except StorageError:
+            logger.exception("Could not remove expired video files for %s", video["id"])
+    return len(expired)
+
+
+def sniff_video_mime(path: Path) -> str | None:
+    try:
+        with path.open("rb") as media_file:
+            header = media_file.read(16)
+    except OSError:
+        return None
+    if len(header) >= 12 and header[4:8] == b"ftyp":
+        return "video/quicktime" if header[8:12] == b"qt  " else "video/mp4"
+    if header.startswith(b"\x1aE\xdf\xa3"):
+        return "video/webm"
+    if len(header) >= 12 and header[:4] == b"RIFF" and header[8:12] == b"AVI ":
+        return "video/x-msvideo"
+    return None
+
+
+def validated_video_metadata(path: Path, declared_mime: str) -> tuple[str, dict[str, float | int | None]]:
+    detected_mime = sniff_video_mime(path)
+    if not detected_mime:
+        raise HTTPException(status_code=415, detail="The file contents are not a supported video container")
+    compatible = {
+        "video/mp4": {"video/mp4", "video/quicktime"},
+        "video/quicktime": {"video/mp4", "video/quicktime"},
+        "video/webm": {"video/webm"},
+        "video/x-msvideo": {"video/x-msvideo"},
+    }
+    if detected_mime not in compatible.get(declared_mime, set()):
+        raise HTTPException(status_code=415, detail="The file contents do not match the selected video type")
+    scan_for_malware(path)
+    metadata = probe_video(path)
+    if not metadata["duration"] or not metadata["width"] or not metadata["height"]:
+        raise HTTPException(status_code=422, detail="The video could not be decoded")
+    return detected_mime, metadata
+
+
+def scan_for_malware(path: Path) -> None:
+    """Use the host scanner when present; production can require it explicitly."""
+    if MALWARE_SCAN_MODE == "off":
+        return
+    scanner = shutil.which("clamdscan") or shutil.which("clamscan")
+    if not scanner:
+        if MALWARE_SCAN_MODE == "required":
+            raise HTTPException(status_code=503, detail="Malware scanning is required but no scanner is available")
+        return
+    try:
+        result = subprocess.run(
+            [scanner, "--no-summary", str(path)], capture_output=True, text=True, timeout=90, check=False
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise HTTPException(status_code=503, detail="Malware scanning timed out") from exc
+    if result.returncode == 1:
+        raise HTTPException(status_code=422, detail="The file was rejected by the malware scanner")
+    if result.returncode not in (0, 1) and MALWARE_SCAN_MODE == "required":
+        raise HTTPException(status_code=503, detail="Malware scanning could not be completed")
+
+
+def build_chapters(segments) -> list[dict]:
+    """Build readable chapters locally, without pretending to be model-generated."""
+    if not segments:
+        return []
+    chapters: list[list] = []
+    current: list = []
+    chapter_start = float(segments[0].start_seconds)
+    for segment in segments:
+        if current and (float(segment.end_seconds) - chapter_start >= 180 or float(segment.start_seconds) - float(current[-1].end_seconds) >= 12):
+            chapters.append(current)
+            current = []
+            chapter_start = float(segment.start_seconds)
+        current.append(segment)
+    if current:
+        chapters.append(current)
+    result = []
+    for position, group in enumerate(chapters):
+        summary = " ".join(item.text.strip() for item in group).strip()
+        title_words = re.findall(r"[A-Za-z0-9][A-Za-z0-9'’-]*", summary)[:8]
+        title = " ".join(title_words) or f"Chapter {position + 1}"
+        if len(summary) > 280:
+            summary = summary[:277].rsplit(" ", 1)[0] + "…"
+        result.append({
+            "position": position,
+            "start_seconds": float(group[0].start_seconds),
+            "end_seconds": float(group[-1].end_seconds),
+            "title": title,
+            "summary": summary,
+        })
+    return result
 
 
 def probe_video(path: Path) -> dict[str, float | int | None]:
@@ -118,12 +743,384 @@ def probe_video(path: Path) -> dict[str, float | int | None]:
             "height": stream.get("height"),
         }
     except (FileNotFoundError, subprocess.SubprocessError, ValueError, json.JSONDecodeError):
-        return {"duration": None, "width": None, "height": None}
+        try:
+            import cv2
+
+            capture = cv2.VideoCapture(str(path))
+            try:
+                if not capture.isOpened():
+                    raise ValueError("Video metadata unavailable")
+                frame_count = capture.get(cv2.CAP_PROP_FRAME_COUNT)
+                fps = capture.get(cv2.CAP_PROP_FPS)
+                return {
+                    "duration": round(frame_count / fps, 2) if frame_count and fps else None,
+                    "width": int(capture.get(cv2.CAP_PROP_FRAME_WIDTH)) or None,
+                    "height": int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT)) or None,
+                }
+            finally:
+                capture.release()
+        except (ImportError, ValueError):
+            return {"duration": None, "width": None, "height": None}
+
+
+def queue_analysis(connection: sqlite3.Connection, video_id: str) -> None:
+    now = int(time.time())
+    connection.execute(
+        """
+        INSERT INTO analysis_jobs (id, video_id, status, progress, error, attempts, created_at, updated_at)
+        VALUES (?, ?, 'queued', 0, NULL, 0, ?, ?)
+        ON CONFLICT(video_id) DO UPDATE SET status = 'queued', progress = 0, error = NULL, updated_at = excluded.updated_at
+        """,
+        (uuid.uuid4().hex, video_id, now, now),
+    )
+
+
+def queue_transcript(connection: sqlite3.Connection, video_id: str) -> None:
+    now = int(time.time())
+    connection.execute(
+        """
+        INSERT INTO transcript_jobs (id, video_id, status, error, attempts, created_at, updated_at)
+        VALUES (?, ?, 'queued', NULL, 0, ?, ?)
+        ON CONFLICT(video_id) DO UPDATE SET status = 'queued', error = NULL, updated_at = excluded.updated_at
+        """,
+        (uuid.uuid4().hex, video_id, now, now),
+    )
+
+
+def run_analysis_job(video_id: str) -> None:
+    if video_id in cancelled_video_ids:
+        cancelled_video_ids.discard(video_id)
+        return
+    now = int(time.time())
+    with db() as connection:
+        claimed = connection.execute(
+            """
+            UPDATE analysis_jobs
+            SET status = 'processing', progress = 10, attempts = attempts + 1, updated_at = ?
+            WHERE video_id = ? AND status = 'queued'
+            """,
+            (now, video_id),
+        )
+        video = connection.execute("SELECT path FROM videos WHERE id = ?", (video_id,)).fetchone()
+    if claimed.rowcount == 0 or not video:
+        return
+
+    try:
+        metadata = probe_video(Path(video["path"]))
+        with db() as connection:
+            connection.execute(
+                "UPDATE videos SET duration = ?, width = ?, height = ? WHERE id = ?",
+                (metadata["duration"], metadata["width"], metadata["height"], video_id),
+            )
+            connection.execute(
+                "UPDATE analysis_jobs SET progress = 35, updated_at = ? WHERE video_id = ?",
+                (int(time.time()), video_id),
+            )
+        extracted = extract_scene_thumbnails(Path(video["path"]), UPLOADS, video_id)
+        if video_id in cancelled_video_ids:
+            shutil.rmtree(UPLOADS / "derived" / video_id, ignore_errors=True)
+            cancelled_video_ids.discard(video_id)
+            return
+        with db() as connection:
+            if not connection.execute("SELECT 1 FROM videos WHERE id = ?", (video_id,)).fetchone():
+                shutil.rmtree(UPLOADS / "derived" / video_id, ignore_errors=True)
+                return
+            connection.execute("DELETE FROM scenes WHERE video_id = ?", (video_id,))
+            created_at = int(time.time())
+            connection.executemany(
+                """
+                INSERT INTO scenes
+                  (id, video_id, position, start_seconds, end_seconds, label, thumbnail_path, detection_method, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        uuid.uuid4().hex,
+                        video_id,
+                        scene.position,
+                        scene.start_seconds,
+                        scene.end_seconds,
+                        scene.label,
+                        str(scene.thumbnail_path),
+                        scene.detection_method,
+                        created_at,
+                    )
+                    for scene in extracted
+                ],
+            )
+            connection.execute(
+                "UPDATE analysis_jobs SET status = 'ready', progress = 100, error = NULL, updated_at = ? WHERE video_id = ?",
+                (created_at, video_id),
+            )
+    except AnalysisError as exc:
+        with db() as connection:
+            connection.execute(
+                "UPDATE analysis_jobs SET status = 'failed', progress = 0, error = ?, updated_at = ? WHERE video_id = ?",
+                (str(exc), int(time.time()), video_id),
+            )
+    except Exception:
+        with db() as connection:
+            connection.execute(
+                "UPDATE analysis_jobs SET status = 'failed', progress = 0, error = ?, updated_at = ? WHERE video_id = ?",
+                ("Timeline extraction failed unexpectedly", int(time.time()), video_id),
+            )
+
+
+def run_transcript_job(video_id: str) -> None:
+    if video_id in cancelled_video_ids:
+        return
+    with db() as connection:
+        claimed = connection.execute(
+            """
+            UPDATE transcript_jobs
+            SET status = 'processing', attempts = attempts + 1, updated_at = ?
+            WHERE video_id = ? AND status = 'queued'
+            """,
+            (int(time.time()), video_id),
+        )
+        video = connection.execute("SELECT path FROM videos WHERE id = ?", (video_id,)).fetchone()
+    if claimed.rowcount == 0 or not video:
+        return
+
+    try:
+        segments = transcribe_video(Path(video["path"]), UPLOADS, video_id)
+        if video_id in cancelled_video_ids:
+            return
+        with db() as connection:
+            if not connection.execute("SELECT 1 FROM videos WHERE id = ?", (video_id,)).fetchone():
+                return
+            connection.execute("DELETE FROM transcript_segments WHERE video_id = ?", (video_id,))
+            connection.execute("DELETE FROM transcript_chapters WHERE video_id = ?", (video_id,))
+            created_at = int(time.time())
+            connection.executemany(
+                """
+                INSERT INTO transcript_segments
+                  (id, video_id, position, start_seconds, end_seconds, text, speaker, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (uuid.uuid4().hex, video_id, index, segment.start_seconds, segment.end_seconds, segment.text, getattr(segment, "speaker", None), created_at)
+                    for index, segment in enumerate(segments)
+                ],
+            )
+            connection.executemany(
+                """
+                INSERT INTO transcript_chapters
+                  (id, video_id, position, start_seconds, end_seconds, title, summary, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (uuid.uuid4().hex, video_id, chapter["position"], chapter["start_seconds"], chapter["end_seconds"], chapter["title"], chapter["summary"], created_at)
+                    for chapter in build_chapters(segments)
+                ],
+            )
+            status = "ready" if segments else "no_speech"
+            connection.execute(
+                "UPDATE transcript_jobs SET status = ?, error = NULL, updated_at = ? WHERE video_id = ?",
+                (status, created_at, video_id),
+            )
+    except TranscriptionUnavailable as exc:
+        status, detail = "not_configured", str(exc)
+    except NoAudioTrack as exc:
+        status, detail = "no_audio", str(exc)
+    except TranscriptionError as exc:
+        status, detail = "failed", str(exc)
+    except Exception:
+        status, detail = "failed", "Transcription failed unexpectedly"
+    else:
+        return
+    with db() as connection:
+        connection.execute(
+            "UPDATE transcript_jobs SET status = ?, error = ?, updated_at = ? WHERE video_id = ?",
+            (status, detail, int(time.time()), video_id),
+        )
+
+
+def run_video_jobs(video_id: str) -> None:
+    run_analysis_job(video_id)
+    run_transcript_job(video_id)
+
+
+def import_error_is_retryable(message: str) -> bool:
+    lowered = message.lower()
+    permanent = ("private", "drm", "sign in", "login", "age-restricted", "not available", "unsupported", "limit")
+    return not any(marker in lowered for marker in permanent)
+
+
+def run_import_job(import_id: str) -> None:
+    with db() as connection:
+        job = connection.execute(
+            "SELECT * FROM import_jobs WHERE id = ? AND workspace_id = ?",
+            (import_id, ACTIVE_WORKSPACE_ID),
+        ).fetchone()
+        if not job or job["status"] not in {"queued", "processing"}:
+            return
+        if job["cancel_requested"]:
+            connection.execute(
+                "UPDATE import_jobs SET status = 'cancelled', detail = 'Import cancelled', updated_at = ? WHERE id = ?",
+                (int(time.time()), import_id),
+            )
+            return
+        connection.execute(
+            "UPDATE import_jobs SET status = 'processing', progress = MAX(progress, 3), detail = 'Checking the link', attempts = attempts + 1, updated_at = ? WHERE id = ?",
+            (int(time.time()), import_id),
+        )
+
+    last_progress = 3
+
+    def cancelled() -> bool:
+        if import_id in cancelled_import_ids:
+            return True
+        with db() as connection:
+            record = connection.execute(
+                "SELECT cancel_requested FROM import_jobs WHERE id = ?", (import_id,)
+            ).fetchone()
+        return not record or bool(record["cancel_requested"])
+
+    def update_progress(progress: int) -> None:
+        nonlocal last_progress
+        progress = max(last_progress, min(95, int(progress)))
+        if progress <= last_progress:
+            return
+        last_progress = progress
+        detail = "Downloading video" if progress < 90 else "Checking playback"
+        with db() as connection:
+            connection.execute(
+                "UPDATE import_jobs SET progress = ?, detail = ?, updated_at = ? WHERE id = ?",
+                (progress, detail, int(time.time()), import_id),
+            )
+
+    try:
+        media = None
+        last_error: RemoteImportError | None = None
+        for retry in range(IMPORT_AUTO_RETRIES + 1):
+            try:
+                media = import_remote_video(
+                    job["source_url"], UPLOADS, import_id, MAX_UPLOAD_BYTES,
+                    MAX_REMOTE_DURATION_SECONDS, REMOTE_IMPORT_TIMEOUT_SECONDS,
+                    update_progress, cancelled,
+                )
+                break
+            except RemoteImportCancelled:
+                raise
+            except RemoteImportError as exc:
+                last_error = exc
+                if retry >= IMPORT_AUTO_RETRIES or not import_error_is_retryable(str(exc)):
+                    raise
+                with db() as connection:
+                    connection.execute(
+                        "UPDATE import_jobs SET detail = ?, updated_at = ? WHERE id = ?",
+                        (f"Platform unavailable — retrying automatically ({retry + 1}/{IMPORT_AUTO_RETRIES})", int(time.time()), import_id),
+                    )
+                time.sleep(min(2 ** retry, 4))
+        if media is None:
+            raise last_error or RemoteImportError("The online video could not be imported")
+        if cancelled():
+            media.path.unlink(missing_ok=True)
+            raise RemoteImportCancelled("The online video import was cancelled")
+        metadata = probe_video(media.path)
+        if not metadata["duration"] or not metadata["width"] or not metadata["height"]:
+            media.path.unlink(missing_ok=True)
+            raise RemoteImportError("The downloaded file could not be decoded as a video")
+        video_id = uuid.uuid4().hex
+        size = media.path.stat().st_size
+        with db() as connection:
+            connection.execute(
+                """
+                INSERT INTO videos
+                  (id, workspace_id, name, path, mime_type, size_bytes, duration, width, height, status, created_at, source_type, source_url)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?, 'url', ?)
+                """,
+                (
+                    video_id,
+                    ACTIVE_WORKSPACE_ID,
+                    media.title,
+                    str(media.path),
+                    media.mime_type,
+                    size,
+                    metadata["duration"],
+                    metadata["width"],
+                    metadata["height"],
+                    int(time.time()),
+                    media.source_url,
+                ),
+            )
+            queue_analysis(connection, video_id)
+            queue_transcript(connection, video_id)
+            connection.execute(
+                """
+                UPDATE import_jobs
+                SET status = 'ready', progress = 100, detail = 'Video ready', video_id = ?, error = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                (video_id, int(time.time()), import_id),
+            )
+        run_video_jobs(video_id)
+    except RemoteImportCancelled:
+        for partial in UPLOADS.glob(f"{import_id}.*"):
+            partial.unlink(missing_ok=True)
+        with db() as connection:
+            connection.execute(
+                "UPDATE import_jobs SET status = 'cancelled', detail = 'Import cancelled', error = NULL, updated_at = ? WHERE id = ?",
+                (int(time.time()), import_id),
+            )
+    except RemoteImportError as exc:
+        with db() as connection:
+            connection.execute(
+                "UPDATE import_jobs SET status = 'failed', detail = 'Import stopped', error = ?, updated_at = ? WHERE id = ?",
+                (str(exc), int(time.time()), import_id),
+            )
+    except Exception:
+        logger.exception("Background import %s failed", import_id)
+        with db() as connection:
+            connection.execute(
+                "UPDATE import_jobs SET status = 'failed', detail = 'Import stopped', error = 'The online video could not be imported', updated_at = ? WHERE id = ?",
+                (int(time.time()), import_id),
+            )
+    finally:
+        cancelled_import_ids.discard(import_id)
+
+
+def run_pending_import_jobs() -> None:
+    with db() as connection:
+        pending = connection.execute(
+            "SELECT id FROM import_jobs WHERE workspace_id = ? AND status = 'queued' ORDER BY created_at",
+            (ACTIVE_WORKSPACE_ID,),
+        ).fetchall()
+    for job in pending:
+        run_import_job(job["id"])
+
+
+def run_pending_analysis_jobs() -> None:
+    with db() as connection:
+        missing_metadata = connection.execute(
+            "SELECT id, path FROM videos WHERE source_type != 'demo' AND (duration IS NULL OR width IS NULL OR height IS NULL)"
+        ).fetchall()
+    for video in missing_metadata:
+        metadata = probe_video(Path(video["path"]))
+        with db() as connection:
+            connection.execute(
+                "UPDATE videos SET duration = ?, width = ?, height = ? WHERE id = ?",
+                (metadata["duration"], metadata["width"], metadata["height"], video["id"]),
+            )
+    with db() as connection:
+        pending = connection.execute("SELECT video_id FROM analysis_jobs WHERE status = 'queued' ORDER BY created_at").fetchall()
+    for job in pending:
+        run_analysis_job(job["video_id"])
+    with db() as connection:
+        pending_transcripts = connection.execute(
+            "SELECT video_id FROM transcript_jobs WHERE status = 'queued' ORDER BY created_at"
+        ).fetchall()
+    for job in pending_transcripts:
+        run_transcript_job(job["video_id"])
 
 
 def video_record(video_id: str) -> sqlite3.Row:
     with db() as connection:
-        record = connection.execute("SELECT * FROM videos WHERE id = ?", (video_id,)).fetchone()
+        record = connection.execute(
+            "SELECT * FROM videos WHERE id = ? AND workspace_id = ?",
+            (video_id, ACTIVE_WORKSPACE_ID),
+        ).fetchone()
     if not record:
         raise HTTPException(status_code=404, detail="Video not found")
     return record
@@ -134,23 +1131,175 @@ def health() -> dict[str, str]:
     return {"status": "ok", "mode": inference_mode()}
 
 
+@app.get("/api/metrics")
+def metrics() -> dict:
+    total = request_metrics["requests"]
+    with db() as connection:
+        queues = {
+            "imports": connection.execute("SELECT COUNT(*) AS count FROM import_jobs WHERE status IN ('queued','processing')").fetchone()["count"],
+            "analysis": connection.execute("SELECT COUNT(*) AS count FROM analysis_jobs WHERE status IN ('queued','processing')").fetchone()["count"],
+            "transcripts": connection.execute("SELECT COUNT(*) AS count FROM transcript_jobs WHERE status IN ('queued','processing')").fetchone()["count"],
+        }
+    return {
+        "requests": total,
+        "average_request_ms": round(request_duration_ms / total, 2) if total else 0,
+        "responses": {key.removeprefix("status_"): value for key, value in request_metrics.items() if key.startswith("status_")},
+        "queues": queues,
+    }
+
+
+@app.get("/api/config")
+def public_config() -> dict:
+    return {
+        "max_upload_bytes": MAX_UPLOAD_BYTES,
+        "allowed_mime_types": sorted(ALLOWED_MIME),
+        "chat_requests_per_hour": CHAT_REQUESTS_PER_HOUR,
+        "uploads_per_hour": UPLOADS_PER_HOUR,
+        "inference_mode": inference_mode(),
+        "max_remote_duration_seconds": MAX_REMOTE_DURATION_SECONDS,
+        "remote_import_timeout_seconds": REMOTE_IMPORT_TIMEOUT_SECONDS,
+        "remote_platforms": sorted(platform_hosts()),
+        "transcription_available": bool(os.getenv("OPENAI_API_KEY")),
+        "workspace": {"id": ACTIVE_WORKSPACE_ID, "name": LOCAL_WORKSPACE_NAME, "mode": "local-development"},
+    }
+
+
+@app.get("/api/workspace")
+def current_workspace() -> dict:
+    with db() as connection:
+        workspace = connection.execute(
+            """
+            SELECT workspaces.id, workspaces.name, workspace_members.role,
+                   COUNT(DISTINCT videos.id) AS video_count
+            FROM workspaces
+            JOIN workspace_members
+              ON workspace_members.workspace_id = workspaces.id
+             AND workspace_members.account_id = ?
+            LEFT JOIN videos ON videos.workspace_id = workspaces.id
+            WHERE workspaces.id = ?
+            GROUP BY workspaces.id, workspace_members.role
+            """,
+            (LOCAL_ACCOUNT_ID, ACTIVE_WORKSPACE_ID),
+        ).fetchone()
+    if not workspace:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+    return {**dict(workspace), "mode": "local-development"}
+
+
+@app.get("/api/developer/api-keys")
+def list_api_keys() -> list[dict]:
+    with db() as connection:
+        rows = connection.execute(
+            "SELECT id, name, key_prefix, created_at, last_used_at, revoked_at FROM api_keys WHERE workspace_id = ? ORDER BY created_at DESC",
+            (ACTIVE_WORKSPACE_ID,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+@app.post("/api/developer/api-keys", status_code=201)
+def create_api_key(payload: ApiKeyCreateRequest) -> dict:
+    raw_key = "uv_" + secrets.token_urlsafe(32)
+    record = {
+        "id": uuid.uuid4().hex,
+        "name": payload.name.strip(),
+        "key_prefix": raw_key[:11],
+        "created_at": int(time.time()),
+    }
+    with db() as connection:
+        connection.execute(
+            "INSERT INTO api_keys (id, workspace_id, name, key_prefix, key_hash, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (record["id"], ACTIVE_WORKSPACE_ID, record["name"], record["key_prefix"], hashlib.sha256(raw_key.encode()).hexdigest(), record["created_at"]),
+        )
+    return {**record, "key": raw_key, "notice": "Copy this key now. It will not be shown again."}
+
+
+@app.delete("/api/developer/api-keys/{key_id}", status_code=204)
+def revoke_api_key(key_id: str) -> Response:
+    with db() as connection:
+        changed = connection.execute(
+            "UPDATE api_keys SET revoked_at = ? WHERE id = ? AND workspace_id = ? AND revoked_at IS NULL",
+            (int(time.time()), key_id, ACTIVE_WORKSPACE_ID),
+        )
+    if changed.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Active API key not found")
+    return Response(status_code=204)
+
+
+@app.get("/api/developer/webhooks")
+def list_webhooks() -> list[dict]:
+    with db() as connection:
+        rows = connection.execute(
+            "SELECT id, url, events, created_at, disabled_at FROM webhook_subscriptions WHERE workspace_id = ? ORDER BY created_at DESC",
+            (ACTIVE_WORKSPACE_ID,),
+        ).fetchall()
+    return [{**dict(row), "events": json.loads(row["events"])} for row in rows]
+
+
+@app.post("/api/developer/webhooks", status_code=201)
+def create_webhook(payload: WebhookCreateRequest) -> dict:
+    url = str(payload.url)
+    validate_public_https_url(url)
+    webhook_id = uuid.uuid4().hex
+    signing_secret = "whsec_" + secrets.token_urlsafe(32)
+    created_at = int(time.time())
+    with db() as connection:
+        connection.execute(
+            "INSERT INTO webhook_subscriptions (id, workspace_id, url, events, signing_secret, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (webhook_id, ACTIVE_WORKSPACE_ID, url, json.dumps(payload.events), signing_secret, created_at),
+        )
+    return {"id": webhook_id, "url": url, "events": payload.events, "created_at": created_at, "signing_secret": signing_secret, "notice": "Copy the signing secret now. It will not be shown again."}
+
+
+@app.post("/api/developer/webhooks/{webhook_id}/test")
+def test_webhook(webhook_id: str) -> dict:
+    with db() as connection:
+        hook = connection.execute(
+            "SELECT url, signing_secret FROM webhook_subscriptions WHERE id = ? AND workspace_id = ? AND disabled_at IS NULL",
+            (webhook_id, ACTIVE_WORKSPACE_ID),
+        ).fetchone()
+    if not hook:
+        raise HTTPException(status_code=404, detail="Active webhook not found")
+    validate_public_https_url(hook["url"])
+    body = json.dumps({"id": uuid.uuid4().hex, "event": "webhook.test", "created_at": int(time.time())}).encode()
+    signature = hmac.new(hook["signing_secret"].encode(), body, hashlib.sha256).hexdigest()
+    request = urllib.request.Request(hook["url"], data=body, method="POST", headers={"Content-Type": "application/json", "X-UnderstandVideo-Signature": f"sha256={signature}"})
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            status = response.status
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="The webhook endpoint did not accept the test event") from exc
+    return {"delivered": 200 <= status < 300, "status_code": status}
+
+
+@app.delete("/api/developer/webhooks/{webhook_id}", status_code=204)
+def disable_webhook(webhook_id: str) -> Response:
+    with db() as connection:
+        changed = connection.execute(
+            "UPDATE webhook_subscriptions SET disabled_at = ? WHERE id = ? AND workspace_id = ? AND disabled_at IS NULL",
+            (int(time.time()), webhook_id, ACTIVE_WORKSPACE_ID),
+        )
+    if changed.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Active webhook not found")
+    return Response(status_code=204)
+
+
 @app.post("/api/videos/upload", status_code=201)
-async def upload_video(request: Request, file: UploadFile = File(...)) -> dict:
-    upload_limit = int(os.getenv("UPLOADS_PER_HOUR", "20"))
-    enforce_rate_limit(f"upload:{request.client.host if request.client else 'unknown'}", limit=upload_limit)
+async def upload_video(request: Request, background_tasks: BackgroundTasks, file: UploadFile = File(...)) -> dict:
+    enforce_rate_limit("upload", limit=UPLOADS_PER_HOUR)
     mime = file.content_type or mimetypes.guess_type(file.filename or "")[0] or ""
     if mime not in ALLOWED_MIME:
         raise HTTPException(status_code=415, detail="Unsupported video format")
 
     video_id = uuid.uuid4().hex
-    target = UPLOADS / f"{video_id}-{safe_name(file.filename or 'video.mp4')}"
+    target = storage().upload_path(video_id, safe_name(file.filename or "video.mp4"))
     size = 0
     try:
         with target.open("wb") as output:
             while chunk := await file.read(1024 * 1024):
                 size += len(chunk)
                 if size > MAX_UPLOAD_BYTES:
-                    raise HTTPException(status_code=413, detail="Video exceeds the 100 MB limit")
+                    limit_mb = MAX_UPLOAD_BYTES / (1024 * 1024)
+                    raise HTTPException(status_code=413, detail=f"Video exceeds the {limit_mb:g} MB limit")
                 output.write(chunk)
     except Exception:
         target.unlink(missing_ok=True)
@@ -158,37 +1307,937 @@ async def upload_video(request: Request, file: UploadFile = File(...)) -> dict:
     finally:
         await file.close()
 
-    metadata = probe_video(target)
+    try:
+        mime, metadata = validated_video_metadata(target, mime)
+    except HTTPException:
+        target.unlink(missing_ok=True)
+        raise
+    source_type = "demo" if is_demo_video(target) else "upload"
     with db() as connection:
         connection.execute(
-            "INSERT INTO videos VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (video_id, file.filename or target.name, str(target), mime, size, metadata["duration"], metadata["width"], metadata["height"], "ready", int(time.time())),
+            """
+            INSERT INTO videos
+              (id, workspace_id, name, path, mime_type, size_bytes, duration, width, height, status, created_at, source_type, source_url)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (video_id, ACTIVE_WORKSPACE_ID, file.filename or target.name, str(target), mime, size, metadata["duration"], metadata["width"], metadata["height"], "ready", int(time.time()), source_type, None),
         )
-    return {"id": video_id, "name": file.filename, "size_bytes": size, "status": "ready", **metadata}
+        if source_type != "demo":
+            queue_analysis(connection, video_id)
+            queue_transcript(connection, video_id)
+    if source_type != "demo":
+        background_tasks.add_task(run_video_jobs, video_id)
+    return {
+        "id": video_id,
+        "name": file.filename,
+        "size_bytes": size,
+        "status": "ready",
+        "source_type": source_type,
+        "source_url": None,
+        "analysis_status": "ready" if source_type == "demo" else "queued",
+        "analysis_progress": 100 if source_type == "demo" else 0,
+        **metadata,
+    }
+
+
+@app.post("/api/videos/import-url", status_code=201)
+async def import_video_url(request: Request, background_tasks: BackgroundTasks, payload: UrlImportRequest) -> dict:
+    enforce_rate_limit("upload", limit=UPLOADS_PER_HOUR)
+    video_id = uuid.uuid4().hex
+    try:
+        media = await asyncio.wait_for(
+            asyncio.to_thread(
+                import_remote_video,
+                str(payload.url),
+                UPLOADS,
+                video_id,
+                MAX_UPLOAD_BYTES,
+                MAX_REMOTE_DURATION_SECONDS,
+                REMOTE_IMPORT_TIMEOUT_SECONDS,
+            ),
+            timeout=REMOTE_IMPORT_TIMEOUT_SECONDS + 5,
+        )
+    except asyncio.TimeoutError as exc:
+        for partial in UPLOADS.glob(f"{video_id}.*"):
+            partial.unlink(missing_ok=True)
+        raise HTTPException(status_code=504, detail="The online video import timed out") from exc
+    except RemoteImportError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    metadata = probe_video(media.path)
+    size = media.path.stat().st_size
+    with db() as connection:
+        connection.execute(
+            """
+            INSERT INTO videos
+              (id, workspace_id, name, path, mime_type, size_bytes, duration, width, height, status, created_at, source_type, source_url)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'url', ?)
+            """,
+            (video_id, ACTIVE_WORKSPACE_ID, media.title, str(media.path), media.mime_type, size, metadata["duration"], metadata["width"], metadata["height"], "ready", int(time.time()), media.source_url),
+        )
+        queue_analysis(connection, video_id)
+        queue_transcript(connection, video_id)
+    background_tasks.add_task(run_video_jobs, video_id)
+    return {
+        "id": video_id,
+        "name": media.title,
+        "size_bytes": size,
+        "status": "ready",
+        "source_type": "url",
+        "source_url": media.source_url,
+        "content_url": f"/api/videos/{video_id}/content",
+        "analysis_status": "queued",
+        "analysis_progress": 0,
+        **metadata,
+    }
+
+
+@app.post("/api/imports", status_code=202)
+def create_import_job(request: Request, background_tasks: BackgroundTasks, payload: UrlImportRequest) -> dict:
+    enforce_rate_limit("upload", limit=UPLOADS_PER_HOUR)
+    import_id = uuid.uuid4().hex
+    now = int(time.time())
+    with db() as connection:
+        connection.execute(
+            """
+            INSERT INTO import_jobs
+              (id, workspace_id, source_url, status, progress, detail, video_id, error, cancel_requested, created_at, updated_at)
+            VALUES (?, ?, ?, 'queued', 0, 'Waiting to start', NULL, NULL, 0, ?, ?)
+            """,
+            (import_id, ACTIVE_WORKSPACE_ID, str(payload.url), now, now),
+        )
+    background_tasks.add_task(run_import_job, import_id)
+    return {"id": import_id, "status": "queued", "progress": 0, "detail": "Waiting to start"}
+
+
+@app.get("/api/imports")
+def list_import_jobs(active: bool = False, limit: int = Query(default=10, ge=1, le=50)) -> list[dict]:
+    with db() as connection:
+        if active:
+            records = connection.execute(
+                """
+                SELECT id, source_url, status, progress, detail, video_id, error, created_at, updated_at
+                FROM import_jobs
+                WHERE workspace_id = ? AND status IN ('queued', 'processing')
+                ORDER BY created_at DESC LIMIT ?
+                """,
+                (ACTIVE_WORKSPACE_ID, limit),
+            ).fetchall()
+        else:
+            records = connection.execute(
+                """
+                SELECT id, source_url, status, progress, detail, video_id, error, created_at, updated_at
+                FROM import_jobs WHERE workspace_id = ? ORDER BY created_at DESC LIMIT ?
+                """,
+                (ACTIVE_WORKSPACE_ID, limit),
+            ).fetchall()
+    return [dict(record) for record in records]
+
+
+@app.get("/api/imports/{import_id}")
+def import_job(import_id: str) -> dict:
+    with db() as connection:
+        job = connection.execute(
+            """
+            SELECT id, source_url, status, progress, detail, video_id, error, created_at, updated_at
+            FROM import_jobs WHERE id = ? AND workspace_id = ?
+            """,
+            (import_id, ACTIVE_WORKSPACE_ID),
+        ).fetchone()
+        if not job:
+            raise HTTPException(status_code=404, detail="Import not found")
+        result = dict(job)
+        if job["video_id"]:
+            video = connection.execute(
+                """
+                SELECT videos.id, videos.name, videos.size_bytes, videos.duration, videos.width, videos.height,
+                       videos.status, videos.created_at, videos.source_type, videos.source_url,
+                       COALESCE(analysis_jobs.status, 'queued') AS analysis_status,
+                       COALESCE(analysis_jobs.progress, 0) AS analysis_progress
+                FROM videos LEFT JOIN analysis_jobs ON analysis_jobs.video_id = videos.id
+                WHERE videos.id = ? AND videos.workspace_id = ?
+                """,
+                (job["video_id"], ACTIVE_WORKSPACE_ID),
+            ).fetchone()
+            result["video"] = dict(video) if video else None
+    return result
+
+
+@app.post("/api/imports/{import_id}/cancel", status_code=202)
+def cancel_import_job(import_id: str) -> dict:
+    with db() as connection:
+        job = connection.execute(
+            "SELECT status FROM import_jobs WHERE id = ? AND workspace_id = ?",
+            (import_id, ACTIVE_WORKSPACE_ID),
+        ).fetchone()
+        if not job:
+            raise HTTPException(status_code=404, detail="Import not found")
+        if job["status"] in {"ready", "failed", "cancelled"}:
+            return {"id": import_id, "status": job["status"]}
+        connection.execute(
+            "UPDATE import_jobs SET cancel_requested = 1, detail = 'Cancelling import', updated_at = ? WHERE id = ?",
+            (int(time.time()), import_id),
+        )
+    cancelled_import_ids.add(import_id)
+    return {"id": import_id, "status": "cancelling"}
+
+
+@app.post("/api/imports/{import_id}/retry", status_code=202)
+def retry_import_job(import_id: str, background_tasks: BackgroundTasks) -> dict:
+    with db() as connection:
+        job = connection.execute(
+            "SELECT status FROM import_jobs WHERE id = ? AND workspace_id = ?",
+            (import_id, ACTIVE_WORKSPACE_ID),
+        ).fetchone()
+        if not job:
+            raise HTTPException(status_code=404, detail="Import not found")
+        if job["status"] not in {"failed", "cancelled"}:
+            raise HTTPException(status_code=409, detail="Only stopped imports can be retried")
+        connection.execute(
+            """
+            UPDATE import_jobs
+            SET status = 'queued', progress = 0, detail = 'Waiting to retry', video_id = NULL,
+                error = NULL, cancel_requested = 0, updated_at = ?
+            WHERE id = ?
+            """,
+            (int(time.time()), import_id),
+        )
+    cancelled_import_ids.discard(import_id)
+    background_tasks.add_task(run_import_job, import_id)
+    return {"id": import_id, "status": "queued", "progress": 0, "detail": "Waiting to retry"}
+
+
+@app.post("/api/videos/{video_id}/reimport", status_code=202)
+async def reimport_video_url(video_id: str, background_tasks: BackgroundTasks) -> dict:
+    video = video_record(video_id)
+    if video["source_type"] != "url" or not video["source_url"]:
+        raise HTTPException(status_code=409, detail="Only videos added from a public link can be repaired")
+
+    repair_id = f"{video_id}-repair-{uuid.uuid4().hex[:8]}"
+    cancelled_video_ids.add(video_id)
+    try:
+        media = await asyncio.wait_for(
+            asyncio.to_thread(
+                import_remote_video,
+                video["source_url"],
+                UPLOADS,
+                repair_id,
+                MAX_UPLOAD_BYTES,
+                MAX_REMOTE_DURATION_SECONDS,
+                REMOTE_IMPORT_TIMEOUT_SECONDS,
+            ),
+            timeout=REMOTE_IMPORT_TIMEOUT_SECONDS + 5,
+        )
+    except asyncio.TimeoutError as exc:
+        for partial in UPLOADS.glob(f"{repair_id}.*"):
+            partial.unlink(missing_ok=True)
+        raise HTTPException(status_code=504, detail="The online video import timed out") from exc
+    except RemoteImportError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    finally:
+        cancelled_video_ids.discard(video_id)
+
+    metadata = probe_video(media.path)
+    if not metadata["duration"]:
+        media.path.unlink(missing_ok=True)
+        raise HTTPException(status_code=422, detail="The repaired download still did not contain a playable video")
+
+    old_path = Path(video["path"])
+    size = media.path.stat().st_size
+    with db() as connection:
+        connection.execute("DELETE FROM scenes WHERE video_id = ?", (video_id,))
+        connection.execute("DELETE FROM transcript_segments WHERE video_id = ?", (video_id,))
+        connection.execute(
+            """
+            UPDATE videos
+            SET name = ?, path = ?, mime_type = ?, size_bytes = ?, duration = ?, width = ?, height = ?, status = 'ready'
+            WHERE id = ? AND workspace_id = ?
+            """,
+            (
+                media.title,
+                str(media.path),
+                media.mime_type,
+                size,
+                metadata["duration"],
+                metadata["width"],
+                metadata["height"],
+                video_id,
+                ACTIVE_WORKSPACE_ID,
+            ),
+        )
+        queue_analysis(connection, video_id)
+        queue_transcript(connection, video_id)
+    try:
+        storage().delete_video(old_path, video_id)
+    except StorageError:
+        logger.warning("Could not remove the replaced media for video %s", video_id)
+    for stale_download in UPLOADS.glob(f"{video_id}.*"):
+        stale_download.unlink(missing_ok=True)
+
+    background_tasks.add_task(run_video_jobs, video_id)
+    return {
+        "id": video_id,
+        "name": media.title,
+        "size_bytes": size,
+        "status": "ready",
+        "source_type": "url",
+        "source_url": media.source_url,
+        "content_url": f"/api/videos/{video_id}/content",
+        "analysis_status": "queued",
+        "analysis_progress": 0,
+        **metadata,
+    }
 
 
 @app.get("/api/videos")
-def list_videos() -> list[dict]:
+def list_videos(q: str = Query(default="", max_length=200)) -> list[dict]:
+    normalized_query = q.strip().lower()
+    escaped_query = normalized_query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    pattern = f"%{escaped_query}%"
     with db() as connection:
-        records = connection.execute("SELECT id, name, size_bytes, duration, width, height, status, created_at FROM videos ORDER BY created_at DESC").fetchall()
+        records = connection.execute(
+            """
+            SELECT
+              videos.id, videos.name, videos.size_bytes, videos.duration, videos.width, videos.height,
+              videos.status, videos.created_at, videos.source_type, videos.source_url,
+              COALESCE(analysis_jobs.status, CASE WHEN videos.source_type = 'demo' THEN 'ready' ELSE 'queued' END) AS analysis_status,
+              COALESCE(analysis_jobs.progress, CASE WHEN videos.source_type = 'demo' THEN 100 ELSE 0 END) AS analysis_progress,
+              (SELECT GROUP_CONCAT(tag, '|||') FROM video_tags WHERE video_tags.video_id = videos.id) AS tag_list,
+              (SELECT id FROM scenes WHERE scenes.video_id = videos.id ORDER BY position LIMIT 1) AS poster_scene_id
+            FROM videos
+            LEFT JOIN analysis_jobs ON analysis_jobs.video_id = videos.id
+            WHERE videos.workspace_id = ?
+              AND (
+                ? = ''
+                OR LOWER(videos.name) LIKE ? ESCAPE '\\'
+                OR LOWER(COALESCE(videos.source_url, '')) LIKE ? ESCAPE '\\'
+                OR EXISTS (
+                  SELECT 1 FROM video_tags
+                  WHERE video_tags.video_id = videos.id
+                    AND LOWER(video_tags.tag) LIKE ? ESCAPE '\\'
+                )
+                OR EXISTS (
+                  SELECT 1 FROM transcript_segments
+                  WHERE transcript_segments.video_id = videos.id
+                    AND LOWER(transcript_segments.text) LIKE ? ESCAPE '\\'
+                )
+                OR EXISTS (
+                  SELECT 1 FROM annotations
+                  WHERE annotations.video_id = videos.id
+                    AND annotations.workspace_id = videos.workspace_id
+                    AND LOWER(annotations.note) LIKE ? ESCAPE '\\'
+                )
+                OR EXISTS (
+                  SELECT 1 FROM messages
+                  WHERE messages.video_id = videos.id
+                    AND LOWER(messages.content) LIKE ? ESCAPE '\\'
+                )
+              )
+            ORDER BY videos.created_at DESC
+            """,
+            (ACTIVE_WORKSPACE_ID, normalized_query, pattern, pattern, pattern, pattern, pattern, pattern),
+        ).fetchall()
+    videos = []
+    for record in records:
+        item = dict(record)
+        scene_id = item.pop("poster_scene_id")
+        tag_list = item.pop("tag_list", None)
+        item["tags"] = tag_list.split("|||") if tag_list else []
+        item["poster_url"] = f"/api/videos/{item['id']}/scenes/{scene_id}/thumbnail" if scene_id else None
+        videos.append(item)
+    return videos
+
+
+@app.patch("/api/videos/{video_id}")
+def rename_video(video_id: str, payload: RenameVideoRequest) -> dict:
+    video_record(video_id)
+    with db() as connection:
+        connection.execute(
+            "UPDATE videos SET name = ? WHERE id = ? AND workspace_id = ?",
+            (payload.name, video_id, ACTIVE_WORKSPACE_ID),
+        )
+    return {"id": video_id, "name": payload.name}
+
+
+@app.patch("/api/videos/{video_id}/retention")
+def set_video_retention(video_id: str, payload: RetentionRequest) -> dict:
+    video_record(video_id)
+    expires_at = int(time.time()) + payload.days * 86400 if payload.days else None
+    with db() as connection:
+        connection.execute(
+            "UPDATE videos SET expires_at = ? WHERE id = ? AND workspace_id = ?",
+            (expires_at, video_id, ACTIVE_WORKSPACE_ID),
+        )
+    return {"video_id": video_id, "retention_days": payload.days, "expires_at": expires_at}
+
+
+@app.get("/api/videos/{video_id}/review")
+def get_video_review(video_id: str) -> dict:
+    video_record(video_id)
+    with db() as connection:
+        review = connection.execute(
+            "SELECT state, assignee, updated_by, updated_at FROM video_reviews WHERE video_id = ?",
+            (video_id,),
+        ).fetchone()
+    return dict(review) if review else {"state": "draft", "assignee": None, "updated_by": LOCAL_ACCOUNT_ID, "updated_at": None}
+
+
+@app.put("/api/videos/{video_id}/review")
+def update_video_review(video_id: str, payload: ReviewUpdateRequest) -> dict:
+    video_record(video_id)
+    assignee = payload.assignee.strip() if payload.assignee else None
+    now = int(time.time())
+    with db() as connection:
+        connection.execute(
+            """
+            INSERT INTO video_reviews (video_id, state, assignee, updated_by, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(video_id) DO UPDATE SET state = excluded.state, assignee = excluded.assignee,
+              updated_by = excluded.updated_by, updated_at = excluded.updated_at
+            """,
+            (video_id, payload.state, assignee, LOCAL_ACCOUNT_ID, now),
+        )
+    return {"state": payload.state, "assignee": assignee, "updated_by": LOCAL_ACCOUNT_ID, "updated_at": now}
+
+
+@app.get("/api/videos/{video_id}/comments")
+def list_video_comments(video_id: str) -> list[dict]:
+    video_record(video_id)
+    with db() as connection:
+        rows = connection.execute(
+            "SELECT id, account_id, body, timestamp, created_at FROM video_comments WHERE video_id = ? ORDER BY created_at",
+            (video_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+@app.post("/api/videos/{video_id}/comments", status_code=201)
+def create_video_comment(video_id: str, payload: CommentCreateRequest) -> dict:
+    video = video_record(video_id)
+    comment_id = uuid.uuid4().hex
+    timestamp = min(payload.timestamp, float(video["duration"] or payload.timestamp)) if payload.timestamp is not None else None
+    now = int(time.time() * 1000)
+    with db() as connection:
+        connection.execute(
+            "INSERT INTO video_comments (id, video_id, account_id, body, timestamp, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (comment_id, video_id, LOCAL_ACCOUNT_ID, payload.body, timestamp, now),
+        )
+    return {"id": comment_id, "account_id": LOCAL_ACCOUNT_ID, "body": payload.body, "timestamp": timestamp, "created_at": now}
+
+
+@app.delete("/api/videos/{video_id}", status_code=204)
+def delete_video(video_id: str) -> Response:
+    video = video_record(video_id)
+    cancelled_video_ids.add(video_id)
+    media_path = Path(video["path"])
+    with db() as connection:
+        connection.execute("DELETE FROM messages WHERE video_id = ?", (video_id,))
+        connection.execute("DELETE FROM conversations WHERE video_id = ?", (video_id,))
+        connection.execute("DELETE FROM scenes WHERE video_id = ?", (video_id,))
+        connection.execute("DELETE FROM analysis_jobs WHERE video_id = ?", (video_id,))
+        connection.execute("DELETE FROM transcript_segments WHERE video_id = ?", (video_id,))
+        connection.execute("DELETE FROM transcript_jobs WHERE video_id = ?", (video_id,))
+        connection.execute("DELETE FROM videos WHERE id = ?", (video_id,))
+
+    try:
+        storage().delete_video(media_path, video_id)
+    except StorageError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return Response(status_code=204)
+
+
+@app.get("/api/videos/{video_id}/content")
+def video_content(video_id: str) -> FileResponse:
+    video = video_record(video_id)
+    path = Path(video["path"])
+    if not path.is_file():
+        raise HTTPException(status_code=410, detail="Video file is no longer available")
+    return FileResponse(path, media_type=video["mime_type"], headers={"Cache-Control": "private, max-age=3600"})
+
+
+@app.get("/api/videos/{video_id}/clip")
+def video_clip(
+    video_id: str,
+    start: float = Query(default=0, ge=0),
+    duration: float = Query(default=30, ge=1, le=120),
+) -> FileResponse:
+    video = video_record(video_id)
+    video_duration = float(video["duration"] or 0)
+    if video_duration and start >= video_duration:
+        raise HTTPException(status_code=422, detail="Clip start is outside the video")
+    duration = min(duration, max(1, video_duration - start)) if video_duration else duration
+    clip_dir = UPLOADS / "derived" / video_id / "clips"
+    clip_dir.mkdir(parents=True, exist_ok=True)
+    target = clip_dir / f"{int(start * 1000)}-{int(duration * 1000)}.mp4"
+    if not target.is_file():
+        try:
+            import imageio_ffmpeg
+
+            ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+            subprocess.run(
+                [ffmpeg, "-y", "-ss", str(start), "-i", video["path"], "-t", str(duration),
+                 "-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac", "-movflags", "+faststart", str(target)],
+                capture_output=True, timeout=180, check=True,
+            )
+        except (ImportError, OSError, subprocess.SubprocessError) as exc:
+            target.unlink(missing_ok=True)
+            raise HTTPException(status_code=503, detail="The shareable clip could not be created") from exc
+    filename = f"{safe_name(Path(video['name']).stem)}-{int(start)}s-clip.mp4"
+    return FileResponse(target, media_type="video/mp4", filename=filename, headers={"Cache-Control": "private, max-age=86400"})
+
+
+@app.get("/api/videos/{video_id}/analysis")
+def video_analysis(video_id: str) -> dict:
+    video = video_record(video_id)
+    with db() as connection:
+        job = connection.execute(
+            "SELECT status, progress, error, attempts, created_at, updated_at FROM analysis_jobs WHERE video_id = ?",
+            (video_id,),
+        ).fetchone()
+        scenes = connection.execute(
+            """
+            SELECT id, position, start_seconds, end_seconds, label, detection_method
+            FROM scenes WHERE video_id = ? ORDER BY position
+            """,
+            (video_id,),
+        ).fetchall()
+    if video["source_type"] == "demo" and not job:
+        job_payload = {"status": "ready", "progress": 100, "error": None, "attempts": 0}
+    else:
+        job_payload = dict(job) if job else {"status": "queued", "progress": 0, "error": None, "attempts": 0}
+    scene_payload = []
+    for scene in scenes:
+        item = dict(scene)
+        item["thumbnail_url"] = f"/api/videos/{video_id}/scenes/{item['id']}/thumbnail"
+        scene_payload.append(item)
+    return {"video_id": video_id, "job": job_payload, "scenes": scene_payload}
+
+
+@app.get("/api/videos/{video_id}/scenes/{scene_id}/thumbnail")
+def scene_thumbnail(video_id: str, scene_id: str) -> FileResponse:
+    video_record(video_id)
+    with db() as connection:
+        scene = connection.execute(
+            "SELECT thumbnail_path FROM scenes WHERE id = ? AND video_id = ?",
+            (scene_id, video_id),
+        ).fetchone()
+    if not scene:
+        raise HTTPException(status_code=404, detail="Scene thumbnail not found")
+    path = Path(scene["thumbnail_path"])
+    if not path.is_file():
+        raise HTTPException(status_code=410, detail="Scene thumbnail is no longer available")
+    return FileResponse(path, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=86400"})
+
+
+@app.post("/api/videos/{video_id}/analysis/retry", status_code=202)
+def retry_video_analysis(video_id: str, background_tasks: BackgroundTasks) -> dict:
+    video = video_record(video_id)
+    if video["source_type"] == "demo":
+        return {"video_id": video_id, "status": "ready", "progress": 100}
+    with db() as connection:
+        queue_analysis(connection, video_id)
+    background_tasks.add_task(run_analysis_job, video_id)
+    return {"video_id": video_id, "status": "queued", "progress": 0}
+
+
+@app.get("/api/videos/{video_id}/transcript")
+def video_transcript(video_id: str, q: str | None = Query(default=None, max_length=200)) -> dict:
+    video = video_record(video_id)
+    with db() as connection:
+        job = connection.execute(
+            "SELECT status, error, attempts, created_at, updated_at FROM transcript_jobs WHERE video_id = ?",
+            (video_id,),
+        ).fetchone()
+        parameters: list = [video_id]
+        where = "transcript_segments.video_id = ?"
+        query = (q or "").strip()
+        if query:
+            escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            where += " AND text LIKE ? ESCAPE '\\'"
+            parameters.append(f"%{escaped}%")
+        segments = connection.execute(
+            f"""
+            SELECT transcript_segments.id, position, start_seconds, end_seconds, text, speaker,
+                   EXISTS(SELECT 1 FROM transcript_highlights WHERE segment_id = transcript_segments.id) AS highlighted
+            FROM transcript_segments WHERE {where}
+            ORDER BY position LIMIT 200
+            """,
+            parameters,
+        ).fetchall()
+        chapters = connection.execute(
+            "SELECT id, position, start_seconds, end_seconds, title, summary FROM transcript_chapters WHERE video_id = ? ORDER BY position",
+            (video_id,),
+        ).fetchall()
+    if video["source_type"] == "demo" and not job:
+        job_payload = {"status": "not_applicable", "error": "The bundled visual demo has no transcript job", "attempts": 0}
+    else:
+        job_payload = dict(job) if job else {"status": "queued", "error": None, "attempts": 0}
+    return {"video_id": video_id, "query": query, "job": job_payload, "chapters": [dict(chapter) for chapter in chapters], "segments": [dict(segment) for segment in segments]}
+
+
+@app.post("/api/videos/{video_id}/transcript/highlights/{segment_id}", status_code=201)
+def highlight_transcript_segment(video_id: str, segment_id: str) -> dict:
+    video_record(video_id)
+    with db() as connection:
+        segment = connection.execute(
+            "SELECT id, start_seconds, end_seconds, text, speaker FROM transcript_segments WHERE id = ? AND video_id = ?",
+            (segment_id, video_id),
+        ).fetchone()
+        if not segment:
+            raise HTTPException(status_code=404, detail="Transcript line not found")
+        connection.execute(
+            "INSERT OR IGNORE INTO transcript_highlights (id, video_id, segment_id, created_by, created_at) VALUES (?, ?, ?, ?, ?)",
+            (uuid.uuid4().hex, video_id, segment_id, LOCAL_ACCOUNT_ID, int(time.time())),
+        )
+    return {**dict(segment), "highlighted": True}
+
+
+@app.delete("/api/videos/{video_id}/transcript/highlights/{segment_id}", status_code=204)
+def remove_transcript_highlight(video_id: str, segment_id: str) -> Response:
+    video_record(video_id)
+    with db() as connection:
+        connection.execute("DELETE FROM transcript_highlights WHERE video_id = ? AND segment_id = ?", (video_id, segment_id))
+    return Response(status_code=204)
+
+
+@app.post("/api/videos/{video_id}/transcript/retry", status_code=202)
+def retry_video_transcript(video_id: str, background_tasks: BackgroundTasks) -> dict:
+    video = video_record(video_id)
+    if video["source_type"] == "demo":
+        return {"video_id": video_id, "status": "not_applicable"}
+    with db() as connection:
+        queue_transcript(connection, video_id)
+    background_tasks.add_task(run_transcript_job, video_id)
+    return {"video_id": video_id, "status": "queued"}
+
+
+@app.get("/api/videos/{video_id}/tags")
+def list_video_tags(video_id: str) -> list[str]:
+    video_record(video_id)
+    with db() as connection:
+        records = connection.execute(
+            "SELECT tag FROM video_tags WHERE video_id = ? ORDER BY tag",
+            (video_id,),
+        ).fetchall()
+    return [record["tag"] for record in records]
+
+
+@app.post("/api/videos/{video_id}/tags", status_code=201)
+def create_video_tag(video_id: str, payload: TagCreateRequest) -> dict:
+    video_record(video_id)
+    with db() as connection:
+        connection.execute(
+            "INSERT OR IGNORE INTO video_tags (video_id, tag, created_at) VALUES (?, ?, ?)",
+            (video_id, payload.tag, int(time.time() * 1000)),
+        )
+    return {"tag": payload.tag}
+
+
+@app.delete("/api/videos/{video_id}/tags/{tag}", status_code=204)
+def delete_video_tag(video_id: str, tag: str) -> Response:
+    video_record(video_id)
+    normalized = re.sub(r"\s+", " ", tag.strip().lower())
+    with db() as connection:
+        deleted = connection.execute(
+            "DELETE FROM video_tags WHERE video_id = ? AND tag = ?",
+            (video_id, normalized),
+        )
+    if deleted.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Tag not found")
+    return Response(status_code=204)
+
+
+@app.get("/api/videos/{video_id}/annotations")
+def list_annotations(video_id: str) -> list[dict]:
+    video_record(video_id)
+    with db() as connection:
+        records = connection.execute(
+            """
+            SELECT id, timestamp, note, created_at
+            FROM annotations
+            WHERE video_id = ? AND workspace_id = ?
+            ORDER BY timestamp, created_at
+            """,
+            (video_id, ACTIVE_WORKSPACE_ID),
+        ).fetchall()
     return [dict(record) for record in records]
+
+
+@app.post("/api/videos/{video_id}/annotations", status_code=201)
+def create_annotation(video_id: str, payload: AnnotationCreateRequest) -> dict:
+    video = video_record(video_id)
+    timestamp = min(payload.timestamp, float(video["duration"] or payload.timestamp))
+    annotation_id = uuid.uuid4().hex
+    created_at = int(time.time() * 1000)
+    with db() as connection:
+        connection.execute(
+            """
+            INSERT INTO annotations (id, video_id, workspace_id, account_id, timestamp, note, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (annotation_id, video_id, ACTIVE_WORKSPACE_ID, LOCAL_ACCOUNT_ID, timestamp, payload.note, created_at),
+        )
+    return {"id": annotation_id, "timestamp": timestamp, "note": payload.note, "created_at": created_at}
+
+
+@app.delete("/api/videos/{video_id}/annotations/{annotation_id}", status_code=204)
+def delete_annotation(video_id: str, annotation_id: str) -> Response:
+    video_record(video_id)
+    with db() as connection:
+        deleted = connection.execute(
+            "DELETE FROM annotations WHERE id = ? AND video_id = ? AND workspace_id = ?",
+            (annotation_id, video_id, ACTIVE_WORKSPACE_ID),
+        )
+    if deleted.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Annotation not found")
+    return Response(status_code=204)
+
+
+@app.get("/api/videos/{video_id}/export")
+def export_video_notes(
+    video_id: str,
+    format: str = Query(default="markdown", pattern="^(markdown|json|html)$"),
+    template: str = Query(default="brief", pattern="^(brief|research|review)$"),
+) -> Response:
+    video = video_record(video_id)
+    with db() as connection:
+        annotations = [dict(row) for row in connection.execute(
+            "SELECT timestamp, note, created_at FROM annotations WHERE video_id = ? AND workspace_id = ? ORDER BY timestamp",
+            (video_id, ACTIVE_WORKSPACE_ID),
+        ).fetchall()]
+        transcript = [dict(row) for row in connection.execute(
+            "SELECT start_seconds, end_seconds, text, speaker FROM transcript_segments WHERE video_id = ? ORDER BY position",
+            (video_id,),
+        ).fetchall()]
+        chapters = [dict(row) for row in connection.execute(
+            "SELECT start_seconds, end_seconds, title, summary FROM transcript_chapters WHERE video_id = ? ORDER BY position",
+            (video_id,),
+        ).fetchall()]
+        highlights = [dict(row) for row in connection.execute(
+            """SELECT transcript_segments.start_seconds, transcript_segments.text, transcript_segments.speaker
+               FROM transcript_highlights JOIN transcript_segments ON transcript_segments.id = transcript_highlights.segment_id
+               WHERE transcript_highlights.video_id = ? ORDER BY transcript_segments.position""",
+            (video_id,),
+        ).fetchall()]
+        conversations = [dict(row) for row in connection.execute(
+            "SELECT id, title, created_at, updated_at FROM conversations WHERE video_id = ? ORDER BY updated_at DESC",
+            (video_id,),
+        ).fetchall()]
+        for conversation in conversations:
+            conversation["messages"] = [dict(row) for row in connection.execute(
+                "SELECT role, content, created_at FROM messages WHERE video_id = ? AND conversation_id = ? ORDER BY created_at, rowid",
+                (video_id, conversation["id"]),
+            ).fetchall()]
+    payload = {
+        "video": {key: video[key] for key in ("id", "name", "duration", "source_type", "source_url", "created_at")},
+        "annotations": annotations,
+        "transcript": transcript,
+        "chapters": chapters,
+        "highlights": highlights,
+        "conversations": conversations,
+        "template": template,
+    }
+    filename = safe_name(Path(video["name"]).stem) or "video-notes"
+    if format == "json":
+        return Response(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            media_type="application/json",
+            headers={"Content-Disposition": f'attachment; filename="{filename}-notes.json"'},
+        )
+    if format == "html":
+        chapter_html = "".join(
+            f"<li><time>{int(item['start_seconds'] // 60):02d}:{int(item['start_seconds'] % 60):02d}</time><strong>{html.escape(item['title'])}</strong><p>{html.escape(item['summary'])}</p></li>"
+            for item in chapters
+        ) or "<li>No chapters available.</li>"
+        highlight_html = "".join(
+            f"<blockquote><time>{int(item['start_seconds'] // 60):02d}:{int(item['start_seconds'] % 60):02d}</time> {html.escape(item['text'])}</blockquote>"
+            for item in highlights
+        ) or "<p>No highlighted quotes.</p>"
+        document = f"""<!doctype html><html><head><meta charset=\"utf-8\"><title>{html.escape(video['name'])}</title><style>body{{font:16px/1.55 system-ui;color:#111;max-width:820px;margin:64px auto;padding:0 28px}}h1{{font-size:40px;letter-spacing:-.04em}}h2{{margin-top:48px;border-top:1px solid #ccc;padding-top:20px}}li{{margin:20px 0}}time{{font:12px ui-monospace;margin-right:12px;color:#666}}strong{{display:inline}}blockquote{{border-left:2px solid #111;margin:20px 0;padding-left:18px}}</style></head><body><small>{template.upper()} REPORT</small><h1>{html.escape(video['name'])}</h1><p>{len(chapters)} chapters · {len(highlights)} highlights · {len(annotations)} notes</p><h2>Chapters</h2><ol>{chapter_html}</ol><h2>Highlighted quotes</h2>{highlight_html}</body></html>"""
+        return Response(document, media_type="text/html; charset=utf-8", headers={"Content-Disposition": f'attachment; filename="{filename}-{template}.html"'})
+    lines = [f"# {video['name']}", "", f"Duration: {video['duration'] or 'unknown'} seconds", "", "## Annotations", ""]
+    lines.extend(f"- **{int(item['timestamp'] // 60):02d}:{int(item['timestamp'] % 60):02d}** — {item['note']}" for item in annotations)
+    if not annotations:
+        lines.append("_No annotations yet._")
+    lines.extend(["", "## Transcript", ""])
+    lines.extend(
+        f"- **{int(item['start_seconds'] // 60):02d}:{int(item['start_seconds'] % 60):02d}** "
+        + ((item["speaker"] + ": ") if item.get("speaker") else "")
+        + item["text"]
+        for item in transcript
+    )
+    if not transcript:
+        lines.append("_No transcript available._")
+    for conversation in conversations:
+        lines.extend(["", f"## {conversation['title']}", ""])
+        lines.extend(f"**{message['role'].title()}:** {message['content']}" for message in conversation["messages"])
+    return Response(
+        "\n".join(lines) + "\n",
+        media_type="text/markdown; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}-notes.md"'},
+    )
+
+
+@app.post("/api/videos/{video_id}/shares", status_code=201)
+def create_share(video_id: str, payload: ShareCreateRequest) -> dict:
+    video = video_record(video_id)
+    timestamp = min(payload.timestamp, float(video["duration"] or payload.timestamp))
+    token = uuid.uuid4().hex
+    now = int(time.time())
+    expires_at = now + payload.expires_hours * 3600
+    with db() as connection:
+        connection.execute(
+            "INSERT INTO share_links (token, video_id, workspace_id, timestamp, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (token, video_id, ACTIVE_WORKSPACE_ID, timestamp, expires_at, now),
+        )
+    return {"token": token, "timestamp": timestamp, "expires_at": expires_at, "share_path": f"/?share={token}"}
+
+
+def shared_video(token: str) -> sqlite3.Row:
+    with db() as connection:
+        record = connection.execute(
+            """
+            SELECT share_links.token, share_links.timestamp, share_links.expires_at,
+                   videos.id AS video_id, videos.name, videos.duration, videos.mime_type, videos.path
+            FROM share_links JOIN videos ON videos.id = share_links.video_id
+            WHERE share_links.token = ?
+            """,
+            (token,),
+        ).fetchone()
+    if not record:
+        raise HTTPException(status_code=404, detail="Shared moment not found")
+    if record["expires_at"] <= int(time.time()):
+        raise HTTPException(status_code=410, detail="This shared moment has expired")
+    return record
+
+
+@app.get("/api/shares/{token}")
+def share_details(token: str) -> dict:
+    record = shared_video(token)
+    return {
+        "token": token,
+        "video_id": record["video_id"],
+        "name": record["name"],
+        "duration": record["duration"],
+        "timestamp": record["timestamp"],
+        "expires_at": record["expires_at"],
+        "content_url": f"/api/shares/{token}/content",
+    }
+
+
+@app.get("/api/shares/{token}/content")
+def share_content(token: str) -> FileResponse:
+    record = shared_video(token)
+    path = Path(record["path"])
+    if not path.is_file():
+        raise HTTPException(status_code=410, detail="Shared media is no longer available")
+    return FileResponse(path, media_type=record["mime_type"], headers={"Cache-Control": "private, max-age=300"})
+
+
+@app.post("/api/compare")
+def compare_videos(payload: CompareVideosRequest) -> dict:
+    videos = [video_record(video_id) for video_id in payload.video_ids]
+    results = []
+    with db() as connection:
+        for video in videos:
+            scenes = [dict(row) for row in connection.execute(
+                "SELECT position, start_seconds, end_seconds, label, detection_method FROM scenes WHERE video_id = ? ORDER BY position",
+                (video["id"],),
+            ).fetchall()]
+            transcript_count = connection.execute(
+                "SELECT COUNT(*) AS count FROM transcript_segments WHERE video_id = ?",
+                (video["id"],),
+            ).fetchone()["count"]
+            transcript_text = " ".join(
+                row["text"] for row in connection.execute(
+                    "SELECT text FROM transcript_segments WHERE video_id = ? ORDER BY position", (video["id"],)
+                ).fetchall()
+            )
+            results.append({
+                "id": video["id"],
+                "name": video["name"],
+                "duration": video["duration"],
+                "source_type": video["source_type"],
+                "scene_count": len(scenes),
+                "transcript_segment_count": transcript_count,
+                "transcript_text": transcript_text,
+                "scenes": scenes,
+            })
+    first_duration = float(results[0]["duration"] or 0)
+    second_duration = float(results[1]["duration"] or 0)
+    duration_delta = round(second_duration - first_duration, 2)
+    max_scenes = max(len(results[0]["scenes"]), len(results[1]["scenes"]))
+    paired_moments = []
+    for index in range(max_scenes):
+        paired_moments.append({
+            "position": index,
+            "first": results[0]["scenes"][index] if index < len(results[0]["scenes"]) else None,
+            "second": results[1]["scenes"][index] if index < len(results[1]["scenes"]) else None,
+        })
+    if duration_delta == 0:
+        comparison_summary = f"Both videos are the same duration; their timelines contain {results[0]['scene_count']} and {results[1]['scene_count']} saved moments."
+    else:
+        comparison_summary = (
+            f"{results[1]['name']} is {abs(duration_delta):g} seconds "
+            f"{'longer' if duration_delta > 0 else 'shorter'} than {results[0]['name']}; "
+            f"their timelines contain {results[0]['scene_count']} and {results[1]['scene_count']} saved moments."
+        )
+    stop_words = {"the", "and", "that", "this", "with", "from", "have", "were", "what", "when", "your", "about", "into", "then", "they", "them"}
+    term_sets = [
+        {word for word in re.findall(r"[a-z0-9']{4,}", item["transcript_text"].lower()) if word not in stop_words}
+        for item in results
+    ]
+    shared_terms = sorted(term_sets[0] & term_sets[1])[:12]
+    union = term_sets[0] | term_sets[1]
+    transcript_similarity = round(len(term_sets[0] & term_sets[1]) / len(union), 3) if union else None
+    for item in results:
+        item.pop("transcript_text", None)
+    semantic_status = (
+        f"Transcript comparison found {len(shared_terms)} shared key terms."
+        if transcript_similarity is not None
+        else "Generate transcripts for both videos to add topic similarity; visual semantic comparison still needs a vision model."
+    )
+    return {
+        "videos": results,
+        "duration_delta_seconds": duration_delta,
+        "summary": comparison_summary,
+        "paired_moments": paired_moments,
+        "transcript_similarity": transcript_similarity,
+        "shared_terms": shared_terms,
+        "semantic_status": semantic_status,
+    }
 
 
 @app.get("/api/videos/{video_id}/summary")
 def summary(video_id: str) -> dict:
     video = video_record(video_id)
     duration = video["duration"] or 12
+    is_demo = is_demo_video(Path(video["path"]))
+    if is_demo:
+        summary_text = "A trail runner moves through a misty alpine valley as warm sunrise light breaks across the mountains."
+        tags = ["trail running", "mountains", "sunrise"]
+        labels = ["Valley reveal", "Waterfall", "Runner advances", "Summit light"]
+        generated = True
+    else:
+        summary_text = (
+            "The video is uploaded and its timeline is ready. A visual summary will appear after a vision "
+            "model or local Video-ChatGPT worker is configured."
+        )
+        tags = []
+        labels = ["Opening", "Early context", "Key moment", "Conclusion"]
+        generated = False
     return {
         "video_id": video_id,
-        "summary": "The clip establishes its subject, develops the central action, moves through a key transition, and closes by reinforcing the main idea.",
-        "tags": ["visual narrative", "key moments", "scene transition"],
+        "summary": summary_text,
+        "tags": tags,
         "scenes": [
-            {"timestamp": 0, "label": "Opening"},
-            {"timestamp": round(duration * 0.25, 1), "label": "Context"},
-            {"timestamp": round(duration * 0.58, 1), "label": "Key moment"},
-            {"timestamp": round(duration * 0.86, 1), "label": "Conclusion"},
+            {"timestamp": 0, "label": labels[0]},
+            {"timestamp": round(duration * 0.25, 1), "label": labels[1]},
+            {"timestamp": round(duration * 0.58, 1), "label": labels[2]},
+            {"timestamp": round(duration * 0.86, 1), "label": labels[3]},
         ],
         "inference_mode": inference_mode(),
+        "generated": generated,
     }
 
 
@@ -210,15 +2259,39 @@ def grounded_answer(question: str, duration: float) -> str:
 
 @app.post("/api/chat/stream")
 async def stream_chat(request: Request, payload: ChatRequest) -> StreamingResponse:
-    remaining = enforce_rate_limit(f"chat:{request.client.host if request.client else 'unknown'}")
+    remaining = enforce_rate_limit("chat", limit=CHAT_REQUESTS_PER_HOUR)
     video = video_record(payload.video_id)
     conversation_id = payload.conversation_id or uuid.uuid4().hex
     with db() as connection:
+        existing_conversation = connection.execute(
+            "SELECT video_id FROM conversations WHERE id = ?",
+            (conversation_id,),
+        ).fetchone()
+        if existing_conversation and existing_conversation["video_id"] != payload.video_id:
+            raise HTTPException(status_code=409, detail="Conversation belongs to another video")
+        now = int(time.time() * 1000)
+        if not existing_conversation:
+            connection.execute(
+                "INSERT INTO conversations (id, video_id, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                (conversation_id, payload.video_id, "New conversation", now, now),
+            )
         history_rows = connection.execute(
-            "SELECT role, content FROM messages WHERE video_id = ? ORDER BY created_at DESC LIMIT 8",
+            """
+            SELECT role, content FROM messages
+            WHERE video_id = ? AND conversation_id = ?
+            ORDER BY created_at DESC, rowid DESC LIMIT 8
+            """,
+            (payload.video_id, conversation_id),
+        ).fetchall()
+        transcript_rows = connection.execute(
+            """
+            SELECT start_seconds, end_seconds, text FROM transcript_segments
+            WHERE video_id = ? ORDER BY position LIMIT 80
+            """,
             (payload.video_id,),
         ).fetchall()
     history = [dict(row) for row in reversed(history_rows)]
+    transcript = [dict(row) for row in transcript_rows]
     answer = await asyncio.to_thread(
         answer_video_question,
         Path(video["path"]),
@@ -226,11 +2299,20 @@ async def stream_chat(request: Request, payload: ChatRequest) -> StreamingRespon
         history,
         video["duration"] or 12,
         grounded_answer,
+        transcript,
     )
-    now = int(time.time())
+    now = int(time.time() * 1000)
     with db() as connection:
         connection.execute("INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?)", (uuid.uuid4().hex, payload.video_id, conversation_id, "user", payload.message, now))
         connection.execute("INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?)", (uuid.uuid4().hex, payload.video_id, conversation_id, "assistant", answer, now))
+        connection.execute(
+            """
+            UPDATE conversations
+            SET title = CASE WHEN title = 'New conversation' THEN ? ELSE title END, updated_at = ?
+            WHERE id = ? AND video_id = ?
+            """,
+            (payload.message[:120], now, conversation_id, payload.video_id),
+        )
 
     async def events() -> AsyncIterator[str]:
         yield f"data: {json.dumps({'type': 'meta', 'conversation_id': conversation_id, 'remaining': remaining})}\n\n"
@@ -244,9 +2326,89 @@ async def stream_chat(request: Request, payload: ChatRequest) -> StreamingRespon
     return StreamingResponse(events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
-@app.get("/api/videos/{video_id}/messages")
-def messages(video_id: str) -> list[dict]:
+@app.get("/api/videos/{video_id}/conversations")
+def conversations(video_id: str) -> list[dict]:
     video_record(video_id)
     with db() as connection:
-        records = connection.execute("SELECT id, conversation_id, role, content, created_at FROM messages WHERE video_id = ? ORDER BY created_at", (video_id,)).fetchall()
+        records = connection.execute(
+            """
+            SELECT conversations.id, conversations.title, conversations.created_at, conversations.updated_at,
+                   COUNT(messages.id) AS message_count
+            FROM conversations
+            LEFT JOIN messages
+              ON messages.video_id = conversations.video_id
+             AND messages.conversation_id = conversations.id
+            WHERE conversations.video_id = ?
+            GROUP BY conversations.id
+            ORDER BY conversations.updated_at DESC, conversations.created_at DESC
+            """,
+            (video_id,),
+        ).fetchall()
+    return [dict(record) for record in records]
+
+
+@app.post("/api/videos/{video_id}/conversations", status_code=201)
+def create_conversation(video_id: str, payload: ConversationCreateRequest) -> dict:
+    video_record(video_id)
+    conversation_id = uuid.uuid4().hex
+    now = int(time.time() * 1000)
+    with db() as connection:
+        connection.execute(
+            "INSERT INTO conversations (id, video_id, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+            (conversation_id, video_id, payload.title, now, now),
+        )
+    return {"id": conversation_id, "title": payload.title, "created_at": now, "updated_at": now, "message_count": 0}
+
+
+@app.patch("/api/videos/{video_id}/conversations/{conversation_id}")
+def rename_conversation(video_id: str, conversation_id: str, payload: ConversationRenameRequest) -> dict:
+    video_record(video_id)
+    with db() as connection:
+        updated = connection.execute(
+            "UPDATE conversations SET title = ?, updated_at = ? WHERE id = ? AND video_id = ?",
+            (payload.title, int(time.time() * 1000), conversation_id, video_id),
+        )
+    if updated.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return {"id": conversation_id, "title": payload.title}
+
+
+@app.delete("/api/videos/{video_id}/conversations/{conversation_id}", status_code=204)
+def delete_conversation(video_id: str, conversation_id: str) -> Response:
+    video_record(video_id)
+    with db() as connection:
+        exists = connection.execute(
+            "SELECT 1 FROM conversations WHERE id = ? AND video_id = ?",
+            (conversation_id, video_id),
+        ).fetchone()
+        if not exists:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        connection.execute(
+            "DELETE FROM messages WHERE video_id = ? AND conversation_id = ?",
+            (video_id, conversation_id),
+        )
+        connection.execute(
+            "DELETE FROM conversations WHERE id = ? AND video_id = ?",
+            (conversation_id, video_id),
+        )
+    return Response(status_code=204)
+
+
+@app.get("/api/videos/{video_id}/messages")
+def messages(video_id: str, conversation_id: str | None = Query(default=None, max_length=64)) -> list[dict]:
+    video_record(video_id)
+    with db() as connection:
+        if conversation_id:
+            records = connection.execute(
+                """
+                SELECT id, conversation_id, role, content, created_at FROM messages
+                WHERE video_id = ? AND conversation_id = ? ORDER BY created_at, rowid
+                """,
+                (video_id, conversation_id),
+            ).fetchall()
+        else:
+            records = connection.execute(
+                "SELECT id, conversation_id, role, content, created_at FROM messages WHERE video_id = ? ORDER BY created_at, rowid",
+                (video_id,),
+            ).fetchall()
     return [dict(record) for record in records]
