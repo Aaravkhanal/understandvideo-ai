@@ -177,11 +177,10 @@ change explanations.
 
 ## What Aarav needs to provide for transcript quality and production security
 
-For item 1, choose a speaker-diarization provider or local model and supply its
-credentials/runtime. The current schema accepts `speaker` per segment, chapters
-and highlights already work, and workspace search already searches every saved
-transcript. A representative set of 10–20 videos with known speakers is needed
-to measure diarization and chapter quality before enabling it by default.
+For item 1, local Whisper plus pyannote is connected. The schema stores a
+`speaker` per segment, chapters and highlights work, and workspace search covers
+every saved transcript. A representative set of 10–20 videos with known speakers
+is still needed to measure diarization and chapter quality before production tuning.
 
 For item 2, use the checked-in `compose.production.yml` stack and set
 `MALWARE_SCAN_MODE=required`. It starts a private ClamAV service and the standalone
@@ -189,8 +188,9 @@ locked-down worker only after signature loading and its health check succeed, wi
 CPU/memory/process/file-size limits, non-root identity, read-only root filesystem,
 and no worker Linux capabilities. A one-shot initializer owns only the two data
 volumes and then exits. New videos inherit `DEFAULT_RETENTION_DAYS` (90 by
-default), and CI rejects unsafe production configuration. The remaining cutover
-work still needs a real identity provider, PostgreSQL/Redis, private object storage with
-short-lived signed URLs, encryption keys from a secret manager, and an agreed
-retention policy. The checked-in PostgreSQL baseline records migration intent,
-but application queries remain SQLite-first until `DATABASE_URL` is integrated.
+default), and CI rejects unsafe production configuration. Supabase Auth, verified
+JWTs, private Storage policies, server-side mirroring, and five-minute signed
+playback URLs are connected. The remaining cutover work needs PostgreSQL/Redis,
+deployment-managed encryption secrets, and a final retention policy. The
+checked-in PostgreSQL baseline records migration intent, but application queries
+remain SQLite-first until `DATABASE_URL` is integrated.

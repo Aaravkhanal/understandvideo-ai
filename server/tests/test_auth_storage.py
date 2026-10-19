@@ -38,3 +38,15 @@ class SupabaseStorageTests(unittest.TestCase):
             self.assertEqual(request.method, "POST")
             self.assertEqual(request.data, b"video-bytes")
             self.assertNotIn("server-secret", request.full_url)
+
+    def test_signed_playback_link_is_short_lived_and_private(self) -> None:
+        adapter = SupabaseStorage(Path("/tmp/media"), "https://project.supabase.co/storage/v1", "private", "server-secret")
+        with patch("server.storage.urllib.request.urlopen") as open_url:
+            response = open_url.return_value.__enter__.return_value
+            response.read.return_value = b'{"signedURL":"/object/sign/private/user/video/file.mp4?token=short-lived"}'
+            url = adapter.signed_url("user/video/file.mp4", expires_in=300)
+        self.assertEqual(url, "https://project.supabase.co/storage/v1/object/sign/private/user/video/file.mp4?token=short-lived")
+        request = open_url.call_args.args[0]
+        self.assertEqual(request.method, "POST")
+        self.assertEqual(request.data, b'{"expiresIn": 300}')
+        self.assertNotIn("server-secret", url)

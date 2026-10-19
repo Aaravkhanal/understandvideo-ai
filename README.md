@@ -69,8 +69,8 @@ available instead of inventing an answer.
 - Free local timestamped speech transcription with speaker identification,
   automatic chapters, quote highlights, full-text search,
   click-to-seek results, retry state, and answer grounding.
-- Local account/workspace records with workspace-scoped video access and a
-  storage adapter ready for a future S3-compatible implementation.
+- Supabase passwordless authentication with verified JWTs, account-isolated
+  workspaces, and private Storage mirroring under user-scoped object keys.
 - Pluggable demo, cloud-vision, and HTTP worker inference adapters, plus a
   separately runnable grounded-answer worker with storage-root and token checks.
 - Timestamped workspace notes, Markdown/JSON/premium HTML report exports,
@@ -105,8 +105,9 @@ available instead of inventing an answer.
 - ClamAV scanning is enforced only when `MALWARE_SCAN_MODE=required`. The supplied
   production stack runs decoding in a constrained worker container; stronger
   per-file sandboxing can be added with short-lived jobs on the deployment platform.
-- Production authentication, team invitations, semantic embeddings, automatic
-  webhook event fan-out, and PostgreSQL `DATABASE_URL` integration remain deployment work.
+- Team invitations, semantic embeddings, and PostgreSQL `DATABASE_URL`
+  integration remain deployment work. Signed webhooks automatically fan out
+  video-ready, import-failed, and review-updated events with bounded retries.
   Local API-key lifecycle and signed webhook registration/test delivery are available.
 
 The prioritized work is tracked in the
@@ -301,8 +302,9 @@ tests to reject anonymous private API requests.
 The server-side Supabase Storage adapter mirrors each validated original into
 `<user-id>/<video-id>/<filename>` while retaining a local working copy for
 FFmpeg, transcription, and frame extraction. Deletion and retention cleanup
-remove both copies. PostgreSQL/Redis persistence and signed cloud playback URLs
-remain separate production cutovers; local processing still requires durable
+remove both copies. Playback uses five-minute Supabase signed URLs so browsers
+can stream and seek without receiving the server key. PostgreSQL/Redis persistence
+remains a separate production cutover; local processing still requires durable
 worker-visible disk. Never expose `SUPABASE_SERVICE_ROLE_KEY` to Vite or commit
 it—inject it into the API/worker through the deployment secret manager.
 
@@ -312,7 +314,7 @@ stay aligned with server configuration.
 For process isolation, start `npm run dev:worker`, set `VIDEO_WORKER_URL` on the
 API process, and give both processes the same `VIDEO_WORKER_TOKEN`. The worker
 accepts media only from `WORKER_MEDIA_ROOT`; production deployment should place
-the API and worker on a private network and use the future object-storage adapter.
+the API and worker on a private network with the same durable processing volume.
 
 ### API surface
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shutil
+import json
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -30,6 +31,9 @@ class LocalStorage:
         return self.root
 
     def sync_video(self, media_path: Path, account_id: str, video_id: str, mime_type: str) -> str | None:
+        return None
+
+    def signed_url(self, object_key: str, expires_in: int = 300) -> str | None:
         return None
 
     def delete_video(self, media_path: Path, video_id: str, object_key: str | None = None) -> None:
@@ -75,6 +79,32 @@ class SupabaseStorage(LocalStorage):
         object_key = f"{account_id}/{video_id}/{media_path.name}"
         self._request("POST", object_key, media_path.read_bytes(), mime_type)
         return object_key
+
+    def signed_url(self, object_key: str, expires_in: int = 300) -> str:
+        encoded_key = "/".join(urllib.parse.quote(part, safe="") for part in object_key.split("/"))
+        url = f"{self.endpoint.rstrip('/')}/object/sign/{urllib.parse.quote(self.bucket, safe='')}/{encoded_key}"
+        body = json.dumps({"expiresIn": max(30, min(3600, expires_in))}).encode("utf-8")
+        request = urllib.request.Request(
+            url,
+            data=body,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {self.service_role_key}",
+                "apikey": self.service_role_key,
+                "Content-Type": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except (OSError, ValueError) as exc:
+            raise StorageError("Supabase Storage could not create a playback link") from exc
+        signed_path = payload.get("signedURL") or payload.get("signedUrl")
+        if not signed_path:
+            raise StorageError("Supabase Storage returned no playback link")
+        if signed_path.startswith("http"):
+            return signed_path
+        return f"{self.endpoint.rstrip('/')}{signed_path if signed_path.startswith('/') else '/' + signed_path}"
 
     def delete_video(self, media_path: Path, video_id: str, object_key: str | None = None) -> None:
         if object_key:

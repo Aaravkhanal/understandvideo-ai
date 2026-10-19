@@ -25,7 +25,7 @@ from typing import AsyncIterator, Iterator
 
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, RedirectResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field, HttpUrl, field_validator
 
 from server.analysis import AnalysisError, extract_scene_thumbnails
@@ -1157,6 +1157,7 @@ def run_import_job(import_id: str) -> None:
                 (video_id, int(time.time()), import_id),
             )
         run_video_jobs(video_id)
+        emit_webhook_event(job_workspace_id, "video.ready", {"video_id": video_id, "source_type": "url"})
     except RemoteImportCancelled:
         for partial in UPLOADS.glob(f"{import_id}.*"):
             partial.unlink(missing_ok=True)
@@ -1171,6 +1172,7 @@ def run_import_job(import_id: str) -> None:
                 "UPDATE import_jobs SET status = 'failed', detail = 'Import stopped', error = ?, updated_at = ? WHERE id = ?",
                 (str(exc), int(time.time()), import_id),
             )
+        emit_webhook_event(job_workspace_id, "import.failed", {"import_id": import_id, "error": str(exc)})
     except Exception:
         logger.exception("Background import %s failed", import_id)
         with db() as connection:
@@ -1178,6 +1180,7 @@ def run_import_job(import_id: str) -> None:
                 "UPDATE import_jobs SET status = 'failed', detail = 'Import stopped', error = 'The online video could not be imported', updated_at = ? WHERE id = ?",
                 (int(time.time()), import_id),
             )
+        emit_webhook_event(job_workspace_id, "import.failed", {"import_id": import_id, "error": "The online video could not be imported"})
     finally:
         cancelled_import_ids.discard(import_id)
 
@@ -1360,6 +1363,42 @@ def create_webhook(payload: WebhookCreateRequest) -> dict:
     return {"id": webhook_id, "url": url, "events": payload.events, "created_at": created_at, "signing_secret": signing_secret, "notice": "Copy the signing secret now. It will not be shown again."}
 
 
+def emit_webhook_event(workspace_id: str, event: str, data: dict) -> int:
+    with db() as connection:
+        hooks = connection.execute(
+            "SELECT id, url, events, signing_secret FROM webhook_subscriptions WHERE workspace_id = ? AND disabled_at IS NULL",
+            (workspace_id,),
+        ).fetchall()
+    delivered = 0
+    for hook in hooks:
+        if event not in json.loads(hook["events"]):
+            continue
+        try:
+            validate_public_https_url(hook["url"])
+            body = json.dumps(
+                {"id": uuid.uuid4().hex, "event": event, "created_at": int(time.time()), "data": data},
+                separators=(",", ":"),
+            ).encode()
+            signature = hmac.new(hook["signing_secret"].encode(), body, hashlib.sha256).hexdigest()
+            request = urllib.request.Request(
+                hook["url"], data=body, method="POST",
+                headers={"Content-Type": "application/json", "X-UnderstandVideo-Signature": f"sha256={signature}"},
+            )
+            for attempt in range(3):
+                try:
+                    with urllib.request.urlopen(request, timeout=10) as response:
+                        if 200 <= response.status < 300:
+                            delivered += 1
+                            break
+                except Exception:
+                    if attempt == 2:
+                        raise
+                    time.sleep(0.25 * (2 ** attempt))
+        except Exception:
+            logger.exception("Webhook %s delivery failed for %s", hook["id"], event)
+    return delivered
+
+
 @app.post("/api/developer/webhooks/{webhook_id}/test")
 def test_webhook(webhook_id: str) -> dict:
     with db() as connection:
@@ -1443,6 +1482,7 @@ async def upload_video(request: Request, background_tasks: BackgroundTasks, file
             queue_transcript(connection, video_id)
     if source_type != "demo":
         background_tasks.add_task(run_video_jobs, video_id)
+        background_tasks.add_task(emit_webhook_event, active_workspace_id(), "video.ready", {"video_id": video_id, "source_type": source_type})
     return {
         "id": video_id,
         "name": file.filename,
@@ -1500,6 +1540,7 @@ async def import_video_url(request: Request, background_tasks: BackgroundTasks, 
         queue_analysis(connection, video_id)
         queue_transcript(connection, video_id)
     background_tasks.add_task(run_video_jobs, video_id)
+    background_tasks.add_task(emit_webhook_event, active_workspace_id(), "video.ready", {"video_id": video_id, "source_type": "url"})
     return {
         "id": video_id,
         "name": media.title,
@@ -1811,7 +1852,7 @@ def get_video_review(video_id: str) -> dict:
 
 
 @app.put("/api/videos/{video_id}/review")
-def update_video_review(video_id: str, payload: ReviewUpdateRequest) -> dict:
+def update_video_review(video_id: str, payload: ReviewUpdateRequest, background_tasks: BackgroundTasks) -> dict:
     video_record(video_id)
     assignee = payload.assignee.strip() if payload.assignee else None
     now = int(time.time())
@@ -1825,7 +1866,9 @@ def update_video_review(video_id: str, payload: ReviewUpdateRequest) -> dict:
             """,
             (video_id, payload.state, assignee, active_account_id(), now),
         )
-    return {"state": payload.state, "assignee": assignee, "updated_by": active_account_id(), "updated_at": now}
+    result = {"state": payload.state, "assignee": assignee, "updated_by": active_account_id(), "updated_at": now}
+    background_tasks.add_task(emit_webhook_event, active_workspace_id(), "review.updated", {"video_id": video_id, **result})
+    return result
 
 
 @app.get("/api/videos/{video_id}/comments")
@@ -1881,6 +1924,19 @@ def video_content(video_id: str) -> FileResponse:
     if not path.is_file():
         raise HTTPException(status_code=410, detail="Video file is no longer available")
     return FileResponse(path, media_type=video["mime_type"], headers={"Cache-Control": "private, max-age=3600"})
+
+
+@app.get("/api/videos/{video_id}/playback")
+def video_playback(video_id: str) -> dict:
+    video = video_record(video_id)
+    if video["storage_key"]:
+        try:
+            url = storage().signed_url(video["storage_key"], expires_in=300)
+        except StorageError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        if url:
+            return {"url": url, "expires_in": 300, "source": "private-object-storage"}
+    return {"url": f"/api/videos/{video_id}/content", "expires_in": 300, "source": "local-private-media"}
 
 
 @app.get("/api/videos/{video_id}/clip")
@@ -2226,7 +2282,7 @@ def shared_video(token: str) -> sqlite3.Row:
         record = connection.execute(
             """
             SELECT share_links.token, share_links.timestamp, share_links.expires_at,
-                   videos.id AS video_id, videos.name, videos.duration, videos.mime_type, videos.path
+                   videos.id AS video_id, videos.name, videos.duration, videos.mime_type, videos.path, videos.storage_key
             FROM share_links JOIN videos ON videos.id = share_links.video_id
             WHERE share_links.token = ?
             """,
@@ -2254,8 +2310,15 @@ def share_details(token: str) -> dict:
 
 
 @app.get("/api/shares/{token}/content")
-def share_content(token: str) -> FileResponse:
+def share_content(token: str) -> Response:
     record = shared_video(token)
+    if record["storage_key"]:
+        try:
+            signed = storage().signed_url(record["storage_key"], expires_in=300)
+        except StorageError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        if signed:
+            return RedirectResponse(signed, status_code=307, headers={"Cache-Control": "private, no-store"})
     path = Path(record["path"])
     if not path.is_file():
         raise HTTPException(status_code=410, detail="Shared media is no longer available")

@@ -28,6 +28,30 @@ async function apiFetch(input, init = {}) {
   return nativeFetch(input, { ...init, headers });
 }
 
+async function protectedObjectUrl(path) {
+  const response = await apiFetch(path);
+  if (!response.ok) throw new Error('Private media is unavailable');
+  return URL.createObjectURL(await response.blob());
+}
+
+function ProtectedImage({ src, alt = '', ...props }) {
+  const [objectUrl, setObjectUrl] = useState('');
+  useEffect(() => {
+    let active = true;
+    let createdUrl = '';
+    protectedObjectUrl(src).then(url => {
+      createdUrl = url;
+      if (active) setObjectUrl(url);
+      else URL.revokeObjectURL(url);
+    }).catch(() => {});
+    return () => {
+      active = false;
+      if (createdUrl) URL.revokeObjectURL(createdUrl);
+    };
+  }, [src]);
+  return objectUrl ? <img src={objectUrl} alt={alt} {...props} /> : null;
+}
+
 const DEMO_SCENES = [
   { time: 0, label: 'Valley reveal', note: 'A wide sunrise view establishes the alpine setting.', image: '/demo/scene-opening.jpg' },
   { time: 3, label: 'Waterfall', note: 'Fog parts to reveal a waterfall beyond the trail.', image: '/demo/scene-waterfall.jpg' },
@@ -414,11 +438,14 @@ function WorkspaceApp() {
       setAnalysisStatus(status);
       setAnalysisError(result.job?.error || '');
       setProgress(result.job?.progress || 0);
-      setPersistedScenes((result.scenes || []).map(scene => ({
-        ...scene,
-        time: scene.start_seconds,
-        image: `${API_BASE}${scene.thumbnail_url}`
-      })));
+      const sceneItems = await Promise.all((result.scenes || []).map(async scene => {
+        let image = '';
+        if (scene.thumbnail_url) {
+          try { image = await protectedObjectUrl(`${API_BASE}${scene.thumbnail_url}`); } catch { /* keep text-only evidence */ }
+        }
+        return { ...scene, time: scene.start_seconds, image };
+      }));
+      setPersistedScenes(sceneItems);
       setProcessing(status === 'queued' || status === 'processing');
       if (status === 'queued' || status === 'processing') {
         analysisPollRef.current = setTimeout(() => loadAnalysis(id), 900);
@@ -528,6 +555,25 @@ function WorkspaceApp() {
       }
     } catch {
       setToast('The shared moment could not be created');
+    }
+  }
+
+  async function downloadPrivate(path, fallbackName) {
+    try {
+      const response = await apiFetch(`${API_BASE}${path}`);
+      if (!response.ok) throw new Error('Download failed');
+      const disposition = response.headers.get('content-disposition') || '';
+      const match = disposition.match(/filename="?([^";]+)"?/i);
+      const url = URL.createObjectURL(await response.blob());
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = match?.[1] || fallbackName;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch {
+      setToast('The private download could not be prepared');
     }
   }
 
@@ -661,11 +707,16 @@ function WorkspaceApp() {
     setOverview({ summary: 'Loading the saved overview…', tags: [], generated: false });
     setPage('studio');
     try {
-      const response = await apiFetch(`${API_BASE}/api/videos/${video.id}/content${cacheBust ? `?v=${cacheBust}` : ''}`);
-      if (!response.ok) throw new Error('Playback unavailable');
-      const objectUrl = URL.createObjectURL(await response.blob());
-      if (activeVideoIdRef.current === video.id) setVideoUrl(objectUrl);
-      else URL.revokeObjectURL(objectUrl);
+      const playback = await apiFetch(`${API_BASE}/api/videos/${video.id}/playback${cacheBust ? `?v=${cacheBust}` : ''}`);
+      if (!playback.ok) throw new Error('Playback unavailable');
+      const descriptor = await playback.json();
+      if (descriptor.source === 'private-object-storage') {
+        if (activeVideoIdRef.current === video.id) setVideoUrl(descriptor.url);
+      } else {
+        const objectUrl = await protectedObjectUrl(`${API_BASE}${descriptor.url}`);
+        if (activeVideoIdRef.current === video.id) setVideoUrl(objectUrl);
+        else URL.revokeObjectURL(objectUrl);
+      }
     } catch {
       setPlaybackError(true);
     }
@@ -1029,7 +1080,7 @@ function WorkspaceApp() {
           {showDemoInLibrary && <button className="library-video" onClick={loadDemo}><div><img src="/demo/trail-runner.png" alt="Mountain valley demo" /><span><Play size={15} fill="currentColor" /></span></div><strong>Across the alpine valley</strong><small>Demo · 4 scenes · 12 seconds</small></button>}
           {filteredLibraryVideos.map(video => <article className="library-video stored-video" key={video.id}>
             <button className="library-open" onClick={() => openStoredVideo(video)}>
-              <div className="stored-video-preview">{video.poster_url ? <img src={`${API_BASE}${video.poster_url}`} alt="" /> : <FileVideo2 size={27} />}</div>
+              <div className="stored-video-preview">{video.poster_url ? <ProtectedImage src={`${API_BASE}${video.poster_url}`} alt="" /> : <FileVideo2 size={27} />}</div>
               <strong>{video.name}</strong>
               <small>{video.source_type === 'url' ? 'Online link' : 'Upload'} · {video.duration ? formatTime(video.duration) : 'duration unavailable'} · {analysisLabel(video)}</small>
               {video.tags?.length > 0 && <span className="library-tags">{video.tags.join(' · ')}</span>}
@@ -1071,7 +1122,7 @@ function WorkspaceApp() {
               <button className="conversation-new" onClick={newConversation}>New</button>
               {showConversations && <div className="conversation-list">{conversations.length === 0 ? <span>No saved conversations yet</span> : conversations.map(item => editingConversationId === item.id ? <form key={item.id} onSubmit={event => renameConversation(event, item)}><input autoFocus value={conversationDraft} onChange={event => setConversationDraft(event.target.value)} maxLength={120} aria-label={`Rename ${item.title}`} /><button type="submit">Save</button><button type="button" onClick={() => setEditingConversationId('')}>Cancel</button></form> : <div key={item.id} className={item.id === conversationId ? 'active' : ''}><button onClick={() => selectConversation(item)}><strong>{item.title}</strong><small>{item.message_count} messages</small></button>{pendingConversationDeleteId === item.id ? <><button className="conversation-rename" onClick={() => deleteConversation(item)}>Confirm</button><button className="conversation-rename" onClick={() => setPendingConversationDeleteId('')}>Cancel</button></> : <><button className="conversation-rename" onClick={() => { setEditingConversationId(item.id); setConversationDraft(item.title); setPendingConversationDeleteId(''); }}>Rename</button><button className="conversation-rename" onClick={() => { setPendingConversationDeleteId(item.id); setEditingConversationId(''); }}>Delete</button></>}</div>)}</div>}
             </div>}
-            {panel === 'transcript' ? <div className="transcript-panel"><span className="ai-chip">TRANSCRIPT</span><h2>Search what was said</h2><form onSubmit={event => { event.preventDefault(); if (videoId) void loadTranscript(videoId, transcriptQuery); }}><Search size={14} /><input value={transcriptQuery} onChange={event => setTranscriptQuery(event.target.value)} placeholder="Search transcript" disabled={!videoId} /><button type="submit" disabled={!videoId || transcriptLoading}>{transcriptLoading ? 'Searching…' : 'Search'}</button>{transcriptQuery && <button type="button" onClick={() => { setTranscriptQuery(''); if (videoId) void loadTranscript(videoId, ''); }}>Clear</button>}</form>{transcriptChapters.length > 0 && !transcriptQuery && <div className="transcript-chapters"><span>CHAPTERS</span>{transcriptChapters.map(chapter => <button key={chapter.id} onClick={() => seekTo(chapter.start_seconds)}><time>{formatTime(chapter.start_seconds)}</time>{chapter.title}</button>)}</div>}{transcriptStatus === 'ready' && transcriptSegments.length > 0 ? <div className="transcript-results">{transcriptSegments.map(segment => <div key={segment.id} className={segment.highlighted ? 'highlighted' : ''}><button onClick={() => seekTo(segment.start_seconds)}><span>{formatTime(segment.start_seconds)}{segment.speaker ? ` · ${segment.speaker}` : ''}</span><p>{segment.text}</p></button><button onClick={() => toggleTranscriptHighlight(segment)}>{segment.highlighted ? 'Remove highlight' : 'Highlight quote'}</button></div>)}</div> : transcriptStatus === 'ready' && transcriptQuery ? <p className="transcript-empty">No transcript lines match “{transcriptQuery}”.</p> : transcriptStatus === 'queued' || transcriptStatus === 'processing' ? <p className="transcript-empty">Preparing the searchable transcript…</p> : transcriptStatus === 'not_configured' ? <div className="transcript-status"><strong>Local transcription needs attention</strong><p>{transcriptError || 'Install the local speech models or configure another transcription provider.'}</p></div> : transcriptStatus === 'no_audio' || transcriptStatus === 'no_speech' || transcriptStatus === 'not_applicable' ? <div className="transcript-status"><strong>No spoken transcript is available</strong><p>{transcriptError || 'This video does not contain detectable speech.'}</p></div> : transcriptStatus === 'failed' ? <div className="transcript-status"><strong>Transcription stopped</strong><p>{transcriptError}</p><button onClick={retryTranscript}>Retry transcript</button></div> : <p className="transcript-empty">Open a saved video to search its transcript.</p>}</div> : panel === 'overview' ? <div className="overview-panel"><span className="ai-chip">OVERVIEW</span><h2>{overview.generated ? 'What the video shows' : 'Analysis status'}</h2><p>{overview.summary}</p><div className="overview-block"><span>VIDEO DETAILS</span><ul><li><Video size={14} />{fileName}</li><li><Clock3 size={14} />{formatTime(duration)} duration</li><li><ImageIcon size={14} />{overview.generated ? 'Grounded demo overview' : persistedScenes.length ? `${persistedScenes.length} evidence frames ready` : 'Semantic analysis needs a vision model'}</li></ul></div>{overview.tags?.length > 0 && <div className="topic-tags">{overview.tags.map(tag => <span key={tag}>{tag}</span>)}</div>}{videoId && <><div className="video-tag-section"><span>LIBRARY TAGS</span><form onSubmit={addTag}><input value={tagDraft} onChange={event => setTagDraft(event.target.value)} placeholder="Add a searchable tag" maxLength={40} /><button type="submit" disabled={!tagDraft.trim()}>Add</button></form>{videoTags.length > 0 && <div>{videoTags.map(tag => <button key={tag} onClick={() => removeTag(tag)} title={`Remove ${tag}`}>{tag} ×</button>)}</div>}</div><div className="overview-actions"><button onClick={shareCurrentMoment}><Link2 size={12} />Share {formatTime(currentTime)}</button><a href={`${API_BASE}/api/videos/${videoId}/clip?start=${Math.max(0, currentTime - 5)}&duration=30`} download><Download size={12} />Download 30s clip</a><a href={`${API_BASE}/api/videos/${videoId}/export?format=html&template=brief`} download><Download size={12} />Export report</a>{lastShareUrl && <a href={lastShareUrl}>Open shared link</a>}</div><div className="annotation-section"><span>TIMESTAMPED NOTES</span><form onSubmit={addAnnotation}><input value={annotationDraft} onChange={event => setAnnotationDraft(event.target.value)} placeholder={`Add a note at ${formatTime(currentTime)}`} maxLength={1000} /><button type="submit" disabled={!annotationDraft.trim()}>Save</button></form>{annotations.length === 0 ? <p>No notes yet.</p> : annotations.map(annotation => <div key={annotation.id}><button onClick={() => seekTo(annotation.timestamp)}>{formatTime(annotation.timestamp)}</button><p>{annotation.note}</p><button onClick={() => removeAnnotation(annotation.id)}>Remove</button></div>)}</div></>}</div> :
+            {panel === 'transcript' ? <div className="transcript-panel"><span className="ai-chip">TRANSCRIPT</span><h2>Search what was said</h2><form onSubmit={event => { event.preventDefault(); if (videoId) void loadTranscript(videoId, transcriptQuery); }}><Search size={14} /><input value={transcriptQuery} onChange={event => setTranscriptQuery(event.target.value)} placeholder="Search transcript" disabled={!videoId} /><button type="submit" disabled={!videoId || transcriptLoading}>{transcriptLoading ? 'Searching…' : 'Search'}</button>{transcriptQuery && <button type="button" onClick={() => { setTranscriptQuery(''); if (videoId) void loadTranscript(videoId, ''); }}>Clear</button>}</form>{transcriptChapters.length > 0 && !transcriptQuery && <div className="transcript-chapters"><span>CHAPTERS</span>{transcriptChapters.map(chapter => <button key={chapter.id} onClick={() => seekTo(chapter.start_seconds)}><time>{formatTime(chapter.start_seconds)}</time>{chapter.title}</button>)}</div>}{transcriptStatus === 'ready' && transcriptSegments.length > 0 ? <div className="transcript-results">{transcriptSegments.map(segment => <div key={segment.id} className={segment.highlighted ? 'highlighted' : ''}><button onClick={() => seekTo(segment.start_seconds)}><span>{formatTime(segment.start_seconds)}{segment.speaker ? ` · ${segment.speaker}` : ''}</span><p>{segment.text}</p></button><button onClick={() => toggleTranscriptHighlight(segment)}>{segment.highlighted ? 'Remove highlight' : 'Highlight quote'}</button></div>)}</div> : transcriptStatus === 'ready' && transcriptQuery ? <p className="transcript-empty">No transcript lines match “{transcriptQuery}”.</p> : transcriptStatus === 'queued' || transcriptStatus === 'processing' ? <p className="transcript-empty">Preparing the searchable transcript…</p> : transcriptStatus === 'not_configured' ? <div className="transcript-status"><strong>Local transcription needs attention</strong><p>{transcriptError || 'Install the local speech models or configure another transcription provider.'}</p></div> : transcriptStatus === 'no_audio' || transcriptStatus === 'no_speech' || transcriptStatus === 'not_applicable' ? <div className="transcript-status"><strong>No spoken transcript is available</strong><p>{transcriptError || 'This video does not contain detectable speech.'}</p></div> : transcriptStatus === 'failed' ? <div className="transcript-status"><strong>Transcription stopped</strong><p>{transcriptError}</p><button onClick={retryTranscript}>Retry transcript</button></div> : <p className="transcript-empty">Open a saved video to search its transcript.</p>}</div> : panel === 'overview' ? <div className="overview-panel"><span className="ai-chip">OVERVIEW</span><h2>{overview.generated ? 'What the video shows' : 'Analysis status'}</h2><p>{overview.summary}</p><div className="overview-block"><span>VIDEO DETAILS</span><ul><li><Video size={14} />{fileName}</li><li><Clock3 size={14} />{formatTime(duration)} duration</li><li><ImageIcon size={14} />{overview.generated ? 'Grounded demo overview' : persistedScenes.length ? `${persistedScenes.length} evidence frames ready` : 'Semantic analysis needs a vision model'}</li></ul></div>{overview.tags?.length > 0 && <div className="topic-tags">{overview.tags.map(tag => <span key={tag}>{tag}</span>)}</div>}{videoId && <><div className="video-tag-section"><span>LIBRARY TAGS</span><form onSubmit={addTag}><input value={tagDraft} onChange={event => setTagDraft(event.target.value)} placeholder="Add a searchable tag" maxLength={40} /><button type="submit" disabled={!tagDraft.trim()}>Add</button></form>{videoTags.length > 0 && <div>{videoTags.map(tag => <button key={tag} onClick={() => removeTag(tag)} title={`Remove ${tag}`}>{tag} ×</button>)}</div>}</div><div className="overview-actions"><button onClick={shareCurrentMoment}><Link2 size={12} />Share {formatTime(currentTime)}</button><button onClick={() => downloadPrivate("/api/videos/" + videoId + "/clip?start=" + Math.max(0, currentTime - 5) + "&duration=30", fileName + "-clip.mp4")}><Download size={12} />Download 30s clip</button><button onClick={() => downloadPrivate("/api/videos/" + videoId + "/export?format=html&template=brief", fileName + "-report.html")}><Download size={12} />Export report</button>{lastShareUrl && <a href={lastShareUrl}>Open shared link</a>}</div><div className="annotation-section"><span>TIMESTAMPED NOTES</span><form onSubmit={addAnnotation}><input value={annotationDraft} onChange={event => setAnnotationDraft(event.target.value)} placeholder={`Add a note at ${formatTime(currentTime)}`} maxLength={1000} /><button type="submit" disabled={!annotationDraft.trim()}>Save</button></form>{annotations.length === 0 ? <p>No notes yet.</p> : annotations.map(annotation => <div key={annotation.id}><button onClick={() => seekTo(annotation.timestamp)}>{formatTime(annotation.timestamp)}</button><p>{annotation.note}</p><button onClick={() => removeAnnotation(annotation.id)}>Remove</button></div>)}</div></>}</div> :
             processing ? <div className="panel-empty"><span className="ai-loader"><span>•••</span></span><h2>Building the timeline</h2><p>This job is saved, so you can leave and return while the evidence frames are prepared.</p></div> : analysisStatus === 'failed' ? <div className="panel-empty focused-failure"><span className="ai-chip">IMPORT ISSUE</span><h2>{sourceType === 'url' ? 'Repair this web video' : 'Timeline extraction stopped'}</h2><p>{sourceType === 'url' ? 'The saved download is missing a playable video track. The original link is still available.' : analysisError || 'The video could not be decoded.'}</p><button onClick={sourceType === 'url' ? repairRemoteImport : retryAnalysis} disabled={repairingImport}>{sourceType === 'url' ? repairingImport ? 'Repairing…' : 'Repair web import' : 'Retry timeline'}</button>{sourceType === 'url' && sourceUrl && <a href={sourceUrl} target="_blank" rel="noreferrer">Open original link</a>}</div> : messages.length === 0 ? <div className="panel-ready"><span className="ai-chip">VIDEO READY</span><h2>What do you want to know?</h2><p>{sourceType === 'demo' || videoId ? 'Ask about a scene, a change, or a detail. Grounded answers link back to the moment.' : 'The video is open locally. Connect the API and a vision model for grounded answers.'}</p><div className="suggestion-list">{promptSuggestions.map(prompt => <button key={prompt} onClick={() => ask(prompt)}><span>{prompt}</span><ArrowUp size={13} /></button>)}</div><div className="mini-overview"><div>{sourceType === 'demo' ? <img src="/demo/scene-waterfall.jpg" alt="Waterfall scene" /> : persistedScenes[0]?.image && <img src={persistedScenes[0].image} alt="" />}<span><strong>{sourceType === 'demo' ? '4 moments mapped' : persistedScenes.length ? `${persistedScenes.length} evidence frames` : 'Timeline available'}</strong><small>{sourceType === 'demo' ? 'Landscape · movement · light' : persistedScenes.length ? 'Extracted from this video' : 'Semantic analysis needs a vision model'}</small></span></div><button onClick={() => setPanel('overview')}>Open overview <ChevronRight size={12} /></button></div></div> :
             <div className="messages">{messages.map((message, index) => <div key={message.id || index} className={`message ${message.role}`}>{message.role === 'assistant' && <span className="assistant-avatar">U</span>}<div><span className="message-author">{message.role === 'assistant' ? 'UNDERSTAND' : 'YOU'}</span><p>{message.role === 'assistant' ? <TimestampText text={message.text} onSeek={seekTo} /> : message.text}</p></div></div>)}{streaming && <span className="thinking"><i />Reading the scene…</span>}<div ref={chatEndRef} /></div>}
           </div>

@@ -71,6 +71,23 @@ class ApiTestCase(unittest.TestCase):
         self.assertIn("video/mp4", payload["allowed_mime_types"])
         self.assertEqual(payload["workspace"]["id"], main.ACTIVE_WORKSPACE_ID)
 
+    def test_registered_webhook_receives_signed_product_events(self) -> None:
+        with main.db() as connection:
+            connection.execute(
+                "INSERT INTO webhook_subscriptions (id, workspace_id, url, events, signing_secret, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                ("hook-1", main.ACTIVE_WORKSPACE_ID, "https://hooks.example.test/video", '["video.ready"]', "whsec_test", 1),
+            )
+        response = Mock(status=204)
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        with patch("server.main.validate_public_https_url"), patch("server.main.urllib.request.urlopen", return_value=response) as open_url:
+            delivered = main.emit_webhook_event(main.ACTIVE_WORKSPACE_ID, "video.ready", {"video_id": "video-1"})
+        self.assertEqual(delivered, 1)
+        request = open_url.call_args.args[0]
+        self.assertEqual(request.method, "POST")
+        self.assertTrue(request.headers["X-understandvideo-signature"].startswith("sha256="))
+        self.assertIn(b'"video_id":"video-1"', request.data)
+
     def test_default_retention_is_applied_to_new_uploads(self) -> None:
         video_id = self.create_video("retained.avi")
         with main.db() as connection:
@@ -81,6 +98,13 @@ class ApiTestCase(unittest.TestCase):
             video["expires_at"],
             video["created_at"] + main.DEFAULT_RETENTION_DAYS * 86400,
         )
+
+    def test_local_video_playback_uses_an_authenticated_content_route(self) -> None:
+        video_id = self.create_video("playback.avi")
+        response = self.client.get(f"/api/videos/{video_id}/playback")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["url"], f"/api/videos/{video_id}/content")
+        self.assertEqual(response.json()["source"], "local-private-media")
 
     def test_remote_clamav_scans_by_stream_not_worker_path(self) -> None:
         completed = Mock(returncode=0)
