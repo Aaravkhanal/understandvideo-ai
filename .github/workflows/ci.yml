@@ -20,5 +20,21 @@ jobs:
       - run: npm ci
       - run: pip install -r server/requirements.txt
       - run: npm run check
+      - name: Validate production security configuration
+        env:
+          MALWARE_SCAN_MODE: required
+          DEFAULT_RETENTION_DAYS: '90'
+          MAX_UPLOAD_BYTES: '104857600'
+          CORS_ORIGINS: https://video.example.com
+          VIDEO_WORKER_TOKEN: ci-only-token-0123456789abcdef0123456789
+          DATABASE_URL: postgresql://ci-placeholder
+          REDIS_URL: redis://ci-placeholder
+          OBJECT_STORAGE_BUCKET: ci-private-bucket
+          OBJECT_STORAGE_ENDPOINT: https://s3.example.com
+          OIDC_ISSUER_URL: https://example.supabase.co/auth/v1
+          OIDC_AUDIENCE: authenticated
+        run: |
+          npm run validate:production
+          docker compose -f compose.production.yml config --quiet
       - run: npx playwright install --with-deps chromium
       - run: npm run test:e2e

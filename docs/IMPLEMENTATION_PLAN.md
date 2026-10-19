@@ -183,11 +183,14 @@ and highlights already work, and workspace search already searches every saved
 transcript. A representative set of 10–20 videos with known speakers is needed
 to measure diarization and chapter quality before enabling it by default.
 
-For item 2, install ClamAV on the deployment host and set
-`MALWARE_SCAN_MODE=required`; run the standalone worker inside a locked-down
-container with no outbound network, a read-only base filesystem, temporary media
-mounts, CPU/memory/time limits, and regular deletion sweeps. Production also
-needs a real identity provider, PostgreSQL/Redis, private object storage with
+For item 2, use the checked-in `compose.production.yml` stack and set
+`MALWARE_SCAN_MODE=required`. It starts a private ClamAV service and the standalone
+locked-down worker only after signature loading and its health check succeed, with
+CPU/memory/process/file-size limits, non-root identity, read-only root filesystem,
+and no worker Linux capabilities. A one-shot initializer owns only the two data
+volumes and then exits. New videos inherit `DEFAULT_RETENTION_DAYS` (90 by
+default), and CI rejects unsafe production configuration. The remaining cutover
+work still needs a real identity provider, PostgreSQL/Redis, private object storage with
 short-lived signed URLs, encryption keys from a secret manager, and an agreed
 retention policy. The checked-in PostgreSQL baseline records migration intent,
 but application queries remain SQLite-first until `DATABASE_URL` is integrated.

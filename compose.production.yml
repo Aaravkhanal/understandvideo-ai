@@ -1,0 +1,86 @@
+services:
+  storage-init:
+    image: node:22-bookworm-slim
+    command: ["chown", "-R", "1000:1000", "/app/server/uploads", "/app/server/runtime"]
+    user: "0:0"
+    restart: "no"
+    read_only: true
+    volumes:
+      - media:/app/server/uploads
+      - metadata:/app/server/runtime
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+    security_opt:
+      - no-new-privileges:true
+
+  clamav:
+    image: clamav/clamav:stable
+    platform: linux/amd64
+    restart: unless-stopped
+    expose:
+      - "3310"
+    volumes:
+      - clamav-signatures:/var/lib/clamav
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/clamdcheck.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - private-services
+
+  jobs:
+    build:
+      context: .
+      dockerfile: docker/worker.Dockerfile
+    command: ["npm", "run", "jobs"]
+    restart: unless-stopped
+    env_file:
+      - path: .env.production
+        required: false
+    environment:
+      MALWARE_SCAN_MODE: required
+      UPLOAD_ROOT: /app/server/uploads
+      DATABASE_PATH: /app/server/runtime/understandvideo.db
+    depends_on:
+      storage-init:
+        condition: service_completed_successfully
+      clamav:
+        condition: service_healthy
+    volumes:
+      - media:/app/server/uploads
+      - metadata:/app/server/runtime
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    cpus: 2.0
+    mem_limit: 4g
+    memswap_limit: 4g
+    stop_grace_period: 30s
+    ulimits:
+      fsize:
+        soft: 524288
+        hard: 524288
+      nofile:
+        soft: 1024
+        hard: 2048
+    networks:
+      - private-services
+
+volumes:
+  clamav-signatures:
+  media:
+  metadata:
+
+networks:
+  private-services:
+    internal: false

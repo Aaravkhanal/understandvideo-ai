@@ -1,0 +1,15 @@
+.git
+.github
+.venv
+node_modules
+dist
+test-results
+server/uploads
+server/*.db
+**/__pycache__
+*.pyc
+.DS_Store
+docs
+data
+quantitative_evaluation
+video_chatgpt

@@ -66,8 +66,8 @@ available instead of inventing an answer.
 - Durable named conversations per video, including new-thread creation, history
   reopening, automatic first-question titles, inline rename, and independent
   thread deletion.
-- Optional timestamped speech transcription, persisted transcript segments,
-  automatic chapters, speaker-ready labels, quote highlights, full-text search,
+- Free local timestamped speech transcription with speaker identification,
+  automatic chapters, quote highlights, full-text search,
   click-to-seek results, retry state, and answer grounding.
 - Local account/workspace records with workspace-scoped video access and a
   storage adapter ready for a future S3-compatible implementation.
@@ -98,12 +98,13 @@ available instead of inventing an answer.
   online videos cannot be imported.
 - Long online videos may be imported at a lower resolution so the combined
   video and audio remain within `MAX_UPLOAD_BYTES`.
-- Accurate automatic speaker diarization still requires a diarization-capable
-  transcription provider or a local model; the database and UI already accept labels.
+- Local transcription runs on the machine and may be slower than real time on long
+  videos. The first run downloads the selected speech and speaker models.
 - The included queue is durable and separately runnable but remains SQLite/local;
   multi-machine execution needs PostgreSQL/Redis and object storage.
-- ClamAV scanning is enforced only when `MALWARE_SCAN_MODE=required`; true sandboxed
-  decoding still requires an isolated worker container with CPU/memory limits.
+- ClamAV scanning is enforced only when `MALWARE_SCAN_MODE=required`. The supplied
+  production stack runs decoding in a constrained worker container; stronger
+  per-file sandboxing can be added with short-lived jobs on the deployment platform.
 - Production authentication, team invitations, semantic embeddings, automatic
   webhook event fan-out, and PostgreSQL `DATABASE_URL` integration remain deployment work.
   Local API-key lifecycle and signed webhook registration/test delivery are available.
@@ -157,6 +158,23 @@ npm run dev
 The command opens the app at `http://localhost:4310` and starts its API
 on `http://localhost:8787`. These dedicated ports avoid collisions with other
 local projects. API documentation is available at `http://localhost:8787/docs`.
+
+### Free local transcription and speaker identification
+
+The app now defaults to local transcription: faster-whisper creates timestamped
+text and pyannote Community-1 identifies speakers. No paid transcription API is
+required.
+
+1. Create a free Hugging Face account.
+2. Accept the terms for `pyannote/speaker-diarization-community-1`.
+3. Create a fine-grained read token with access to that gated model.
+4. Activate this project's virtual environment and run `hf auth login` once.
+5. Start the app normally. The first transcript downloads the local models and
+   later runs reuse the on-device cache.
+
+Use `LOCAL_WHISPER_MODEL=tiny` for the fastest/lower-accuracy option, `small`
+for the default balance, or `medium` for better accuracy with more disk, memory,
+and processing time. Set `LOCAL_SPEAKER_DIARIZATION=false` if you only need text.
 
 ## Web workspace
 
@@ -214,6 +232,14 @@ Copy `.env.example` values into your shell or preferred environment manager.
 | `OPENAI_REQUEST_TIMEOUT` | `60` | Cloud inference timeout in seconds. |
 | `OPENAI_TRANSCRIPTION_MODEL` | `whisper-1` | Model used for timestamped speech transcription. |
 | `OPENAI_TRANSCRIPTION_TIMEOUT` | `180` | Transcription request timeout in seconds. |
+| `TRANSCRIPTION_PROVIDER` | `local` | Use free `local` models or optional paid `openai` transcription. |
+| `LOCAL_WHISPER_MODEL` | `small` | faster-whisper model size downloaded on first use. |
+| `LOCAL_WHISPER_DEVICE` | `cpu` | Local transcription device. |
+| `LOCAL_WHISPER_COMPUTE_TYPE` | `int8` | Efficient CPU computation mode. |
+| `LOCAL_WHISPER_BEAM_SIZE` | `5` | Speech decoding search width. |
+| `LOCAL_SPEAKER_DIARIZATION` | `true` | Add local speaker labels with pyannote. |
+| `LOCAL_DIARIZATION_MODEL` | `pyannote/speaker-diarization-community-1` | Hugging Face speaker model. |
+| `HUGGINGFACE_TOKEN` | cached login | Optional runtime token; prefer `hf auth login` for local use. |
 | `LOCAL_ACCOUNT_ID` | `local-account` | Development account used before production authentication is connected. |
 | `LOCAL_WORKSPACE_ID` | `local-workspace` | Workspace boundary applied to local API reads and writes. |
 | `LOCAL_WORKSPACE_NAME` | `Personal workspace` | User-facing name for the local workspace record. |
@@ -228,10 +254,43 @@ Copy `.env.example` values into your shell or preferred environment manager.
 | `REMOTE_IMPORT_TIMEOUT_SECONDS` | `180` | Maximum time allowed for link import. |
 | `IMPORT_AUTO_RETRIES` | `2` | Automatic retries for temporary platform failures. |
 | `MALWARE_SCAN_MODE` | `optional` | Use ClamAV when present, require it, or disable scanning. |
+| `DEFAULT_RETENTION_DAYS` | `90` | Automatically delete new non-demo videos after 30, 90, or 365 days; `0` keeps them. |
+| `UPLOAD_ROOT` | `server/uploads` | Local or mounted private-media working directory. |
+| `DATABASE_PATH` | `server/understandvideo.db` | SQLite path used by local and single-host worker deployments. |
 | `JOB_POLL_SECONDS` | `3` | Poll interval for the standalone durable job worker. |
 | `REMOTE_MEDIA_HOSTS` | unset | Optional comma-separated platform hosts added by the server owner. |
 | `CORS_ORIGINS` | local web URLs | Comma-separated browser origins allowed by the API. |
 | `VITE_API_URL` | same origin | Optional direct API base URL for the frontend. |
+
+### Hardened production worker
+
+`compose.production.yml` provides a separately isolated job worker and a private
+ClamAV service. The worker runs as a non-root user with all Linux capabilities
+dropped, a read-only root filesystem, a no-execute temporary filesystem, a 2 CPU
+limit, 4 GB memory limit, process/file-descriptor limits, and a 512 MB file-size
+limit. Uploaded media and the SQLite transition database live on dedicated
+volumes rather than inside the container layer.
+
+1. Copy `.env.production.example` to `.env.production` on the production host.
+2. Put real secrets in the hosting provider's secret manager and inject them as
+   environment variables. Do not save production secret values in the file.
+3. Run `npm run validate:production` in the configured deployment environment.
+4. Start the services with `docker compose -f compose.production.yml up -d --build`.
+
+The stack initializes volume ownership once, waits for the private ClamAV daemon
+to become healthy, and only then starts the non-root worker. Its lightweight image
+includes local Whisper transcription but deliberately excludes pyannote/Torch;
+run speaker diarization in the configured local model environment or a dedicated
+CPU/GPU model service, rather than adding the full model stack to every import worker.
+
+The selected identity direction is Supabase Auth because it can provide OIDC/JWT
+identity alongside managed PostgreSQL. Authentication enforcement, PostgreSQL,
+Redis, and the S3-compatible storage adapter remain deliberate cutover tasks:
+the configuration validator requires their connection settings so production
+cannot be mistakenly presented as fully connected before those adapters land.
+Private object storage should use five-minute signed URLs, block public access,
+enable encryption and versioning, and apply a lifecycle matching
+`DEFAULT_RETENTION_DAYS`.
 
 The browser reads public limits from `/api/config`, so UI labels and validation
 stay aligned with server configuration.

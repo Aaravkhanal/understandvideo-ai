@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import html
 import hmac
+import importlib.util
 import json
 import logging
 import mimetypes
@@ -34,8 +35,8 @@ from server.transcription import NoAudioTrack, TranscriptionError, Transcription
 
 
 ROOT = Path(__file__).resolve().parent
-UPLOADS = ROOT / "uploads"
-DATABASE = ROOT / "understandvideo.db"
+UPLOADS = Path(os.getenv("UPLOAD_ROOT", str(ROOT / "uploads"))).expanduser().resolve()
+DATABASE = Path(os.getenv("DATABASE_PATH", str(ROOT / "understandvideo.db"))).expanduser().resolve()
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", 100 * 1024 * 1024))
 ALLOWED_MIME = {"video/mp4", "video/quicktime", "video/webm", "video/x-msvideo"}
 CHAT_REQUESTS_PER_HOUR = int(os.getenv("CHAT_REQUESTS_PER_HOUR", "50"))
@@ -44,10 +45,14 @@ MAX_REMOTE_DURATION_SECONDS = int(os.getenv("MAX_REMOTE_DURATION_SECONDS", "3600
 REMOTE_IMPORT_TIMEOUT_SECONDS = int(os.getenv("REMOTE_IMPORT_TIMEOUT_SECONDS", "180"))
 IMPORT_AUTO_RETRIES = int(os.getenv("IMPORT_AUTO_RETRIES", "2"))
 MALWARE_SCAN_MODE = os.getenv("MALWARE_SCAN_MODE", "optional").strip().lower()
+DEFAULT_RETENTION_DAYS = int(os.getenv("DEFAULT_RETENTION_DAYS", "90"))
 LOCAL_ACCOUNT_ID = os.getenv("LOCAL_ACCOUNT_ID", "local-account")
 ACTIVE_WORKSPACE_ID = os.getenv("LOCAL_WORKSPACE_ID", "local-workspace")
 LOCAL_WORKSPACE_NAME = os.getenv("LOCAL_WORKSPACE_NAME", "Personal workspace")
 logger = logging.getLogger(__name__)
+
+if DEFAULT_RETENTION_DAYS not in {0, 30, 90, 365}:
+    raise RuntimeError("DEFAULT_RETENTION_DAYS must be 0, 30, 90, or 365")
 
 app = FastAPI(title="UnderstandVideo AI", version="0.1.0")
 app.add_middleware(
@@ -217,6 +222,7 @@ def storage() -> LocalStorage:
 
 def initialize() -> None:
     storage().ensure_ready()
+    DATABASE.parent.mkdir(parents=True, exist_ok=True)
     with db() as connection:
         connection.executescript(
             """
@@ -619,6 +625,10 @@ def safe_name(name: str) -> str:
     return stem[:120] or "video.mp4"
 
 
+def default_expiry(created_at: int) -> int | None:
+    return created_at + DEFAULT_RETENTION_DAYS * 86400 if DEFAULT_RETENTION_DAYS else None
+
+
 def purge_expired_videos() -> int:
     now = int(time.time())
     with db() as connection:
@@ -683,8 +693,14 @@ def scan_for_malware(path: Path) -> None:
             raise HTTPException(status_code=503, detail="Malware scanning is required but no scanner is available")
         return
     try:
+        scan_args = [scanner, "--no-summary"]
+        if Path(scanner).name == "clamdscan":
+            # Stream bytes to a private ClamAV service; it does not need access
+            # to the worker's media volume or host filesystem paths.
+            scan_args.append("--stream")
+        scan_args.append(str(path))
         result = subprocess.run(
-            [scanner, "--no-summary", str(path)], capture_output=True, text=True, timeout=90, check=False
+            scan_args, capture_output=True, text=True, timeout=90, check=False
         )
     except subprocess.TimeoutExpired as exc:
         raise HTTPException(status_code=503, detail="Malware scanning timed out") from exc
@@ -1024,12 +1040,13 @@ def run_import_job(import_id: str) -> None:
             raise RemoteImportError("The downloaded file could not be decoded as a video")
         video_id = uuid.uuid4().hex
         size = media.path.stat().st_size
+        created_at = int(time.time())
         with db() as connection:
             connection.execute(
                 """
                 INSERT INTO videos
-                  (id, workspace_id, name, path, mime_type, size_bytes, duration, width, height, status, created_at, source_type, source_url)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?, 'url', ?)
+                  (id, workspace_id, name, path, mime_type, size_bytes, duration, width, height, status, created_at, source_type, source_url, expires_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?, 'url', ?, ?)
                 """,
                 (
                     video_id,
@@ -1041,8 +1058,9 @@ def run_import_job(import_id: str) -> None:
                     metadata["duration"],
                     metadata["width"],
                     metadata["height"],
-                    int(time.time()),
+                    created_at,
                     media.source_url,
+                    default_expiry(created_at),
                 ),
             )
             queue_analysis(connection, video_id)
@@ -1150,6 +1168,16 @@ def metrics() -> dict:
 
 @app.get("/api/config")
 def public_config() -> dict:
+    transcription_provider = os.getenv("TRANSCRIPTION_PROVIDER", "local").strip().lower()
+    local_transcription_available = (
+        importlib.util.find_spec("faster_whisper") is not None
+        and importlib.util.find_spec("pyannote") is not None
+    )
+    transcription_available = (
+        local_transcription_available
+        if transcription_provider == "local"
+        else bool(os.getenv("OPENAI_API_KEY"))
+    )
     return {
         "max_upload_bytes": MAX_UPLOAD_BYTES,
         "allowed_mime_types": sorted(ALLOWED_MIME),
@@ -1159,7 +1187,9 @@ def public_config() -> dict:
         "max_remote_duration_seconds": MAX_REMOTE_DURATION_SECONDS,
         "remote_import_timeout_seconds": REMOTE_IMPORT_TIMEOUT_SECONDS,
         "remote_platforms": sorted(platform_hosts()),
-        "transcription_available": bool(os.getenv("OPENAI_API_KEY")),
+        "transcription_provider": transcription_provider,
+        "transcription_available": transcription_available,
+        "speaker_diarization_enabled": transcription_provider == "local" and os.getenv("LOCAL_SPEAKER_DIARIZATION", "true").lower() not in {"0", "false", "off"},
         "workspace": {"id": ACTIVE_WORKSPACE_ID, "name": LOCAL_WORKSPACE_NAME, "mode": "local-development"},
     }
 
@@ -1313,14 +1343,15 @@ async def upload_video(request: Request, background_tasks: BackgroundTasks, file
         target.unlink(missing_ok=True)
         raise
     source_type = "demo" if is_demo_video(target) else "upload"
+    created_at = int(time.time())
     with db() as connection:
         connection.execute(
             """
             INSERT INTO videos
-              (id, workspace_id, name, path, mime_type, size_bytes, duration, width, height, status, created_at, source_type, source_url)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              (id, workspace_id, name, path, mime_type, size_bytes, duration, width, height, status, created_at, source_type, source_url, expires_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (video_id, ACTIVE_WORKSPACE_ID, file.filename or target.name, str(target), mime, size, metadata["duration"], metadata["width"], metadata["height"], "ready", int(time.time()), source_type, None),
+            (video_id, ACTIVE_WORKSPACE_ID, file.filename or target.name, str(target), mime, size, metadata["duration"], metadata["width"], metadata["height"], "ready", created_at, source_type, None, None if source_type == "demo" else default_expiry(created_at)),
         )
         if source_type != "demo":
             queue_analysis(connection, video_id)
@@ -1366,14 +1397,15 @@ async def import_video_url(request: Request, background_tasks: BackgroundTasks, 
 
     metadata = probe_video(media.path)
     size = media.path.stat().st_size
+    created_at = int(time.time())
     with db() as connection:
         connection.execute(
             """
             INSERT INTO videos
-              (id, workspace_id, name, path, mime_type, size_bytes, duration, width, height, status, created_at, source_type, source_url)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'url', ?)
+              (id, workspace_id, name, path, mime_type, size_bytes, duration, width, height, status, created_at, source_type, source_url, expires_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'url', ?, ?)
             """,
-            (video_id, ACTIVE_WORKSPACE_ID, media.title, str(media.path), media.mime_type, size, metadata["duration"], metadata["width"], metadata["height"], "ready", int(time.time()), media.source_url),
+            (video_id, ACTIVE_WORKSPACE_ID, media.title, str(media.path), media.mime_type, size, metadata["duration"], metadata["width"], metadata["height"], "ready", created_at, media.source_url, default_expiry(created_at)),
         )
         queue_analysis(connection, video_id)
         queue_transcript(connection, video_id)

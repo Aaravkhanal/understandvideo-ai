@@ -4,7 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
 
@@ -70,6 +70,26 @@ class ApiTestCase(unittest.TestCase):
         self.assertEqual(payload["remote_import_timeout_seconds"], main.REMOTE_IMPORT_TIMEOUT_SECONDS)
         self.assertIn("video/mp4", payload["allowed_mime_types"])
         self.assertEqual(payload["workspace"]["id"], main.ACTIVE_WORKSPACE_ID)
+
+    def test_default_retention_is_applied_to_new_uploads(self) -> None:
+        video_id = self.create_video("retained.avi")
+        with main.db() as connection:
+            video = connection.execute(
+                "SELECT created_at, expires_at FROM videos WHERE id = ?", (video_id,)
+            ).fetchone()
+        self.assertEqual(
+            video["expires_at"],
+            video["created_at"] + main.DEFAULT_RETENTION_DAYS * 86400,
+        )
+
+    def test_remote_clamav_scans_by_stream_not_worker_path(self) -> None:
+        completed = Mock(returncode=0)
+        with patch("server.main.shutil.which", return_value="/usr/bin/clamdscan"), patch(
+            "server.main.subprocess.run", return_value=completed
+        ) as run:
+            main.scan_for_malware(self.video_fixture)
+
+        self.assertIn("--stream", run.call_args.args[0])
 
     def test_workspace_boundary_hides_unowned_videos(self) -> None:
         video_id = self.create_video()

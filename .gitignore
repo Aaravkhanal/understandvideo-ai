@@ -92,6 +92,7 @@ celerybeat.pid
 
 # Environments
 .env
+.env.production
 .venv
 env/
 venv/
@@ -150,3 +151,4 @@ eval_results/
 node_modules/
 server/uploads/
 server/*.db
+test-results/
