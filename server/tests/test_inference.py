@@ -21,7 +21,7 @@ class OllamaInferenceTests(TestCase):
             transcript=[{"start_seconds": 2, "end_seconds": 4, "text": "Let's go"}],
         )
 
-        with patch.dict(os.environ, {"OLLAMA_VISION_MODEL": "qwen3-vl:4b"}, clear=False), patch(
+        with patch.dict(os.environ, {"OLLAMA_VISION_MODEL": "qwen3-vl:2b-instruct"}, clear=False), patch(
             "server.inference.sample_video_frames", return_value=[(3.0, "encoded-frame")]
         ), patch("server.inference.urllib.request.urlopen", return_value=response) as urlopen:
             answer = OllamaInferenceAdapter().answer(request)
@@ -29,9 +29,11 @@ class OllamaInferenceTests(TestCase):
         self.assertEqual(answer, "A runner appears [[00:03]].")
         sent = json.loads(urlopen.call_args.args[0].data.decode())
         self.assertEqual(sent["messages"][0]["images"], ["encoded-frame"])
+        self.assertFalse(sent["think"])
+        self.assertEqual(sent["options"]["num_predict"], 160)
         self.assertIn("image 1 = 3.0s", sent["messages"][0]["content"])
 
     def test_ollama_is_selected_without_paid_api(self) -> None:
-        with patch.dict(os.environ, {"OLLAMA_VISION_MODEL": "qwen3-vl:4b", "OPENAI_API_KEY": ""}, clear=False):
+        with patch.dict(os.environ, {"OLLAMA_VISION_MODEL": "qwen3-vl:2b-instruct", "OPENAI_API_KEY": ""}, clear=False):
             self.assertEqual(inference_mode(), "local-vision")
             self.assertIsInstance(inference_adapter(), OllamaInferenceAdapter)

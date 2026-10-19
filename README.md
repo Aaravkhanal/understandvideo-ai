@@ -237,9 +237,10 @@ Copy `.env.example` values into your shell or preferred environment manager.
 | `OPENAI_TRANSCRIPTION_MODEL` | `whisper-1` | Model used for timestamped speech transcription. |
 | `OPENAI_TRANSCRIPTION_TIMEOUT` | `180` | Transcription request timeout in seconds. |
 | `OLLAMA_URL` | `http://127.0.0.1:11434` | Local Ollama service used for free visual question answering. |
-| `OLLAMA_VISION_MODEL` | unset | Enables local vision inference; recommended value is `qwen3-vl:4b`. |
-| `OLLAMA_FRAME_COUNT` | `6` | Number of timestamped frames sent to the local vision model. |
-| `OLLAMA_REQUEST_TIMEOUT` | `180` | Local model timeout in seconds, including first-load time. |
+| `OLLAMA_VISION_MODEL` | unset | Enables local vision inference; `qwen3-vl:2b-instruct` is recommended on laptops. |
+| `OLLAMA_FRAME_COUNT` | `4` | Number of timestamped frames sent to the local vision model. |
+| `OLLAMA_MAX_FRAME_DIMENSION` | `448` | Local frame edge limit, balancing visual detail and response time. |
+| `OLLAMA_REQUEST_TIMEOUT` | `300` | Local model timeout in seconds, including first-load time. |
 | `TRANSCRIPTION_PROVIDER` | `local` | Use free `local` models or optional paid `openai` transcription. |
 | `LOCAL_WHISPER_MODEL` | `small` | faster-whisper model size downloaded on first use. |
 | `LOCAL_WHISPER_DEVICE` | `cpu` | Local transcription device. |

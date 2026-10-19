@@ -47,7 +47,7 @@ def inference_mode() -> str:
     return os.getenv("INFERENCE_MODE", "demo")
 
 
-def sample_video_frames(path: Path, count: int = 8) -> list[tuple[float, str]]:
+def sample_video_frames(path: Path, count: int = 8, max_dimension: int = 960) -> list[tuple[float, str]]:
     try:
         import cv2
     except ImportError:
@@ -71,7 +71,7 @@ def sample_video_frames(path: Path, count: int = 8) -> list[tuple[float, str]]:
             if not ok:
                 continue
             height, width = frame.shape[:2]
-            scale = min(1.0, 960 / max(width, height))
+            scale = min(1.0, max(224, max_dimension) / max(width, height))
             if scale < 1:
                 frame = cv2.resize(frame, (int(width * scale), int(height * scale)))
             encoded, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 78])
@@ -149,7 +149,11 @@ class OpenAIInferenceAdapter:
 
 class OllamaInferenceAdapter:
     def answer(self, request: InferenceRequest) -> str:
-        frames = sample_video_frames(request.path, count=int(os.getenv("OLLAMA_FRAME_COUNT", "6")))
+        frames = sample_video_frames(
+            request.path,
+            count=int(os.getenv("OLLAMA_FRAME_COUNT", "4")),
+            max_dimension=int(os.getenv("OLLAMA_MAX_FRAME_DIMENSION", "448")),
+        )
         if not frames:
             return "I couldn’t extract readable frames from this video. Try an MP4 encoded with H.264 or a WebM file."
         history_text = "\n".join(f"{item['role']}: {item['content']}" for item in request.history[-6:])
@@ -167,15 +171,16 @@ class OllamaInferenceAdapter:
             f"Conversation:\n{history_text or '(none)'}\n\nQuestion: {request.question}"
         )
         body = json.dumps({
-            "model": os.getenv("OLLAMA_VISION_MODEL", "qwen3-vl:4b"),
+            "model": os.getenv("OLLAMA_VISION_MODEL", "qwen3-vl:2b-instruct"),
             "stream": False,
+            "think": False,
             "messages": [{"role": "user", "content": prompt, "images": [image for _, image in frames]}],
-            "options": {"temperature": 0.1},
+            "options": {"temperature": 0.1, "num_predict": 160},
         }).encode("utf-8")
         endpoint = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/") + "/api/chat"
         try:
             ollama_request = urllib.request.Request(endpoint, data=body, method="POST", headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(ollama_request, timeout=float(os.getenv("OLLAMA_REQUEST_TIMEOUT", "180"))) as response:
+            with urllib.request.urlopen(ollama_request, timeout=float(os.getenv("OLLAMA_REQUEST_TIMEOUT", "300"))) as response:
                 payload = json.loads(response.read().decode("utf-8"))
             answer = str(payload.get("message", {}).get("content", "")).strip()
             if not answer:
