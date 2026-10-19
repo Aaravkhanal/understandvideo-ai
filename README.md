@@ -284,13 +284,23 @@ run speaker diarization in the configured local model environment or a dedicated
 CPU/GPU model service, rather than adding the full model stack to every import worker.
 
 The selected identity direction is Supabase Auth because it can provide OIDC/JWT
-identity alongside managed PostgreSQL. Authentication enforcement, PostgreSQL,
-Redis, and the S3-compatible storage adapter remain deliberate cutover tasks:
-the configuration validator requires their connection settings so production
-cannot be mistakenly presented as fully connected before those adapters land.
-Private object storage should use five-minute signed URLs, block public access,
-enable encryption and versioning, and apply a lifecycle matching
-`DEFAULT_RETENTION_DAYS`.
+identity alongside managed PostgreSQL. The hosted project and a private
+`understandvideo-private` Storage bucket are provisioned. Apply
+`migrations/002_supabase_storage_policies.sql` in the Supabase SQL editor; its
+four policies restrict insert, read, update, and delete operations to object keys
+whose first folder is the authenticated user's id. The bucket must remain
+private, and production object names must follow
+`<user-id>/<video-id>/<filename>` for those policies to allow access.
+
+Real JWT enforcement in the FastAPI service, PostgreSQL/Redis persistence, and
+the server-side Supabase Storage adapter remain deliberate cutover tasks. Until
+those adapters land, the application continues to use its local identity,
+SQLite database, and filesystem media store. The configuration validator still
+requires the intended production connection settings so a deployment cannot be
+mistakenly presented as fully connected. Never expose the Supabase service-role
+key to Vite or commit it; inject it into the API/worker through the deployment
+secret manager. Generated playback links should expire after five minutes and
+storage lifecycle rules should match `DEFAULT_RETENTION_DAYS`.
 
 The browser reads public limits from `/api/config`, so UI labels and validation
 stay aligned with server configuration.
