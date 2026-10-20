@@ -6,8 +6,8 @@
   "scripts": {
     "dev": "concurrently --kill-others --names web,api --prefix-colors green,cyan \"npm:dev:web\" \"npm:dev:api\"",
     "dev:web": "vite --host 127.0.0.1 --port 4310 --strictPort --open",
-    "dev:api": "scripts/with-local-env.sh scripts/python.sh -m uvicorn server.main:app --reload --reload-exclude '.venv/**' --reload-exclude 'server/uploads/**' --host 127.0.0.1 --port 8787",
-    "dev:worker": "scripts/with-local-env.sh scripts/python.sh -m uvicorn server.worker:app --reload --reload-exclude '.venv/**' --reload-exclude 'server/uploads/**' --host 127.0.0.1 --port 8788",
+    "dev:api": "scripts/with-local-env.sh scripts/python.sh -m uvicorn server.main:app --reload --reload-dir server --reload-exclude 'server/uploads/**' --host 127.0.0.1 --port 8787",
+    "dev:worker": "scripts/with-local-env.sh scripts/python.sh -m uvicorn server.worker:app --reload --reload-dir server --reload-exclude 'server/uploads/**' --host 127.0.0.1 --port 8788",
     "jobs": "scripts/with-local-env.sh scripts/python.sh -m server.job_worker",
     "validate:production": "scripts/with-local-env.sh scripts/python.sh scripts/validate_production_config.py",
     "build": "vite build",
