@@ -18,7 +18,7 @@ React + Vite
           │
 FastAPI
   ├─ upload validation and metadata probing
-  ├─ SQLite account/workspace-scoped videos, conversations, and messages
+  ├─ PostgreSQL metadata in connected deployments, with SQLite for isolated tests
   ├─ local storage adapter (cloud implementation pending)
   ├─ request limits and public runtime config
   └─ inference adapter
@@ -190,7 +190,7 @@ and no worker Linux capabilities. A one-shot initializer owns only the two data
 volumes and then exits. New videos inherit `DEFAULT_RETENTION_DAYS` (90 by
 default), and CI rejects unsafe production configuration. Supabase Auth, verified
 JWTs, private Storage policies, server-side mirroring, and five-minute signed
-playback URLs are connected. The remaining cutover work needs PostgreSQL/Redis,
-deployment-managed encryption secrets, and a final retention policy. The
-checked-in PostgreSQL baseline records migration intent, but application queries
-remain SQLite-first until `DATABASE_URL` is integrated.
+playback URLs are connected. `DATABASE_URL` now selects Supabase PostgreSQL
+through its transaction pooler; SQLite remains available for isolated local
+tests. Remaining deployment work is Redis hosting, deployment-managed encryption
+secrets, and a final retention policy.

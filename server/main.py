@@ -11,17 +11,15 @@ import mimetypes
 import os
 import re
 import shutil
-import sqlite3
 import subprocess
 import secrets
 import time
 import urllib.request
 import uuid
 from collections import Counter
-from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
-from typing import AsyncIterator, Iterator
+from typing import AsyncIterator, Any, Iterator
 
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -30,6 +28,7 @@ from pydantic import BaseModel, Field, HttpUrl, field_validator
 
 from server.analysis import AnalysisError, extract_scene_thumbnails
 from server.auth import Identity, auth_mode, verify_bearer_token
+from server.database import connect, using_postgres
 from server.inference import answer_video_question, inference_mode, is_demo_video
 from server.job_queue import notify_jobs
 from server.remote_import import RemoteImportCancelled, RemoteImportError, import_remote_video, platform_hosts, validate_public_https_url
@@ -215,19 +214,8 @@ class WebhookCreateRequest(BaseModel):
         return normalized
 
 
-@contextmanager
-def db() -> Iterator[sqlite3.Connection]:
-    connection = sqlite3.connect(DATABASE)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys = ON")
-    try:
-        yield connection
-        connection.commit()
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        connection.close()
+def db() -> Iterator[Any]:
+    return connect(DATABASE)
 
 
 def storage() -> LocalStorage:
@@ -242,7 +230,8 @@ def storage() -> LocalStorage:
 
 def initialize() -> None:
     storage().ensure_ready()
-    DATABASE.parent.mkdir(parents=True, exist_ok=True)
+    if not using_postgres():
+        DATABASE.parent.mkdir(parents=True, exist_ok=True)
     with db() as connection:
         connection.executescript(
             """
@@ -680,7 +669,7 @@ def enforce_rate_limit(action: str, limit: int = 50, window: int = 3600) -> int:
             INSERT INTO rate_limit_buckets (identity, action, window_start, request_count)
             VALUES (?, ?, ?, 1)
             ON CONFLICT(identity, action, window_start)
-            DO UPDATE SET request_count = request_count + 1
+            DO UPDATE SET request_count = rate_limit_buckets.request_count + 1
             """,
             (active_account_id(), action, window_start),
         )
@@ -853,7 +842,7 @@ def probe_video(path: Path) -> dict[str, float | int | None]:
             return {"duration": None, "width": None, "height": None}
 
 
-def queue_analysis(connection: sqlite3.Connection, video_id: str) -> None:
+def queue_analysis(connection: Any, video_id: str) -> None:
     now = int(time.time())
     connection.execute(
         """
@@ -866,7 +855,7 @@ def queue_analysis(connection: sqlite3.Connection, video_id: str) -> None:
     notify_jobs()
 
 
-def queue_transcript(connection: sqlite3.Connection, video_id: str) -> None:
+def queue_transcript(connection: Any, video_id: str) -> None:
     now = int(time.time())
     connection.execute(
         """
@@ -1219,7 +1208,7 @@ def run_pending_analysis_jobs() -> None:
         run_transcript_job(job["video_id"])
 
 
-def video_record(video_id: str) -> sqlite3.Row:
+def video_record(video_id: str) -> Any:
     with db() as connection:
         record = connection.execute(
             "SELECT * FROM videos WHERE id = ? AND workspace_id = ?",
@@ -1232,7 +1221,11 @@ def video_record(video_id: str) -> sqlite3.Row:
 
 @app.get("/api/health")
 def health() -> dict[str, str]:
-    return {"status": "ok", "mode": inference_mode()}
+    return {
+        "status": "ok",
+        "mode": inference_mode(),
+        "database": "postgresql" if using_postgres() else "sqlite",
+    }
 
 
 @app.get("/api/metrics")
@@ -1276,7 +1269,12 @@ def public_config() -> dict:
         "transcription_provider": transcription_provider,
         "transcription_available": transcription_available,
         "speaker_diarization_enabled": transcription_provider == "local" and os.getenv("LOCAL_SPEAKER_DIARIZATION", "true").lower() not in {"0", "false", "off"},
-        "workspace": {"id": active_workspace_id(), "name": LOCAL_WORKSPACE_NAME, "mode": "local-development"},
+        "database_backend": "postgresql" if using_postgres() else "sqlite",
+        "workspace": {
+            "id": active_workspace_id(),
+            "name": LOCAL_WORKSPACE_NAME,
+            "mode": "supabase" if using_postgres() else "local-development",
+        },
     }
 
 
@@ -1299,7 +1297,7 @@ def current_workspace() -> dict:
         ).fetchone()
     if not workspace:
         raise HTTPException(status_code=404, detail="Workspace not found")
-    return {**dict(workspace), "mode": "local-development"}
+    return {**dict(workspace), "mode": "supabase" if using_postgres() else "local-development"}
 
 
 @app.get("/api/developer/api-keys")
@@ -2282,7 +2280,7 @@ def create_share(video_id: str, payload: ShareCreateRequest) -> dict:
     return {"token": token, "timestamp": timestamp, "expires_at": expires_at, "share_path": f"/?share={token}"}
 
 
-def shared_video(token: str) -> sqlite3.Row:
+def shared_video(token: str) -> Any:
     with db() as connection:
         record = connection.execute(
             """

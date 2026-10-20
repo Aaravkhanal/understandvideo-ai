@@ -103,12 +103,12 @@ available instead of inventing an answer.
   videos. The first run downloads the selected speech and speaker models.
 - The included queue is durable and separately runnable. Redis wake-ups and a
   distributed worker lease are used when `REDIS_URL` is configured, while the
-  database remains the recovery source of truth. Multi-machine execution still
-  requires the pending PostgreSQL metadata migration.
+  database remains the recovery source of truth. `DATABASE_URL` selects shared
+  PostgreSQL metadata for multi-machine deployments.
 - ClamAV scanning is enforced only when `MALWARE_SCAN_MODE=required`. The supplied
   production stack runs decoding in a constrained worker container; stronger
   per-file sandboxing can be added with short-lived jobs on the deployment platform.
-- Team invitations, semantic embeddings, and PostgreSQL `DATABASE_URL`
+- Team invitations and semantic embeddings
   integration remain deployment work. Signed webhooks automatically fan out
   video-ready, import-failed, and review-updated events with bounded retries.
   Local API-key lifecycle and signed webhook registration/test delivery are available.
@@ -312,8 +312,8 @@ The server-side Supabase Storage adapter mirrors each validated original into
 `<user-id>/<video-id>/<filename>` while retaining a local working copy for
 FFmpeg, transcription, and frame extraction. Deletion and retention cleanup
 remove both copies. Playback uses five-minute Supabase signed URLs so browsers
-can stream and seek without receiving the server key. PostgreSQL/Redis persistence
-remains a separate production cutover; local processing still requires durable
+can stream and seek without receiving the server key. Supabase PostgreSQL is used
+when `DATABASE_URL` is configured; local processing still requires durable
 worker-visible disk. Never expose `SUPABASE_SERVICE_ROLE_KEY` to Vite or commit
 it—inject it into the API/worker through the deployment secret manager.
 
