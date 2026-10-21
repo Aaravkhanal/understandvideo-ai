@@ -1,0 +1,16 @@
+# Runtime and test dependencies used by GitHub Actions.
+#
+# Local transcription and speaker diarization are optional integrations. Their
+# PyTorch/CUDA dependency chain is intentionally omitted here because CI tests
+# exercise the integration boundary with fixtures and do not download models.
+fastapi>=0.115,<1
+uvicorn[standard]>=0.30,<1
+python-multipart>=0.0.12,<1
+PyJWT[crypto]>=2.10,<3
+openai>=1.70,<3
+opencv-python-headless>=4.10,<5
+yt-dlp>=2026.1,<2027
+imageio-ffmpeg>=0.6,<1
+redis>=5,<7
+psycopg[binary]>=3.2,<4
+httpx2>=2,<3

@@ -23,10 +23,21 @@
 
 ## Overview
 
-**understandvideo-ai** is an end-to-end multimodal conversational AI system built for deep video comprehension. By harmonizing spatiotemporal visual feature representations with large autoregressive language models, **understandvideo-ai** enables detailed video question answering, temporal reasoning, dense video summarization, and multi-turn conversational interactions about complex video scenes.
+**understandvideo** turns an uploaded file or supported public video link into a
+searchable workspace. It combines playback, scene navigation, transcripts,
+chapters, grounded questions, notes, highlights, collaboration, and exports in
+one restrained interface.
 
 <p align="center">
-  <img src="docs/images/Video-ChatGPT.gif" alt="understandvideo-ai Architecture Demo" width="90%" style="border-radius: 8px;">
+  <a href="https://understandvideo-ai.onrender.com">
+    <img src="docs/product/workspace.png" alt="UnderstandVideo home workspace with upload and public-link import" width="100%">
+  </a>
+</p>
+
+<p align="center">
+  <a href="https://understandvideo-ai.onrender.com">Open the live staging workspace</a>
+  &nbsp;·&nbsp;
+  <a href="public/demo/trail-runner-demo.webm">Watch the included 12-second demo video</a>
 </p>
 
 ---
@@ -130,26 +141,42 @@ Compose production stack for a public production launch.
 
 ---
 
-## Key features
+## Product tour
 
-- **Spatiotemporal Visual Encoding**: Combines frame-level spatial feature extraction (CLIP ViT-L/14) with custom temporal pooling to model dynamic actions and continuous scenes.
-- **Context-Aware Conversational QA**: Retains conversational history across multiple turns, enabling detailed exploration of visual events, objects, actions, and intent.
-- **Zero-Shot Generalization**: Outperforms prior models on open benchmarks including MSVD-QA, MSRVTT-QA, TGIF-QA, and ActivityNet-QA without dataset-specific re-training.
-- **Rigorous Evaluation Framework**: Includes built-in evaluation suites measuring correctness, detail orientation, contextual comprehension, temporal precision, and consistency.
-- **Turnkey Interactive UI**: Powered by Gradio for quick local deployment and seamless video-upload-and-chat experimentation.
-- **Scalable Data & Training Pipeline**: Includes data preprocessing, feature precomputation, instruction tuning, and model weight merging utilities.
+The screenshots below are captured directly from the current React workspace.
+They can be regenerated with `node scripts/capture_readme_media.mjs` while the
+local app is running in demo mode.
+
+### Video studio
+
+<p align="center">
+  <a href="https://understandvideo-ai.onrender.com">
+    <img src="docs/product/video-studio.png" alt="UnderstandVideo analysis studio with video player, scene map, and grounded question panel" width="100%">
+  </a>
+</p>
+
+### Mobile workspace
+
+<p align="center">
+  <img src="docs/product/mobile-workspace.png" alt="UnderstandVideo responsive mobile workspace" width="390">
+</p>
+
+### Key workflows
+
+- Import a local video or a supported public link with progress, retry, and cancellation.
+- Navigate detected moments and jump from answers, transcript results, or highlights to exact timestamps.
+- Search transcripts and saved workspace knowledge across every video.
+- Create chapters, clips, notes, comments, assignments, reviews, comparisons, and polished exports.
+- Keep every account isolated with Supabase authentication, private storage, retention controls, and durable quotas.
 
 ---
 
 ## Architecture
 
-<p align="center">
-  <img src="docs/images/hightlights_video_chatgpt.png" alt="understandvideo-ai System Highlights" width="90%" style="border-radius: 8px;">
-</p>
-
-1. **Video Feature Extraction**: Input video frames are sampled and encoded into spatiotemporal tokens using a visual transformer encoder.
-2. **Multimodal Projection**: A linear adapter layer bridges visual token dimensions into the language model embedding space.
-3. **Autoregressive Decoding**: Visual prefix tokens condition the language model to generate fluent, contextually accurate conversational responses.
+1. **React workspace** — upload, import, playback, timeline, transcript, collaboration, and report interfaces.
+2. **FastAPI application** — authenticated APIs, metadata, conversations, signed media access, quotas, and job orchestration.
+3. **Background processing** — remote import, decoding, scene extraction, transcription, speaker diarization, clips, and webhook delivery.
+4. **Shared services** — PostgreSQL metadata, Redis coordination, private Supabase Storage, and optional local or cloud inference providers.
 
 ---
 
