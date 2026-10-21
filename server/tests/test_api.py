@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -313,6 +314,21 @@ class ApiTestCase(unittest.TestCase):
         self.assertEqual(renamed.status_code, 200)
         self.assertEqual(renamed.json()["title"], "Opening notes")
 
+        exported = self.client.get(
+            f"/api/videos/{video_id}/export",
+            params={"format": "json", "conversation_id": conversation_id},
+        )
+        self.assertEqual(exported.status_code, 200, exported.text)
+        self.assertEqual(len(exported.json()["conversations"]), 1)
+        self.assertEqual(exported.json()["conversations"][0]["title"], "Opening notes")
+        self.assertEqual(
+            self.client.get(
+                f"/api/videos/{video_id}/export",
+                params={"conversation_id": "missing-conversation"},
+            ).status_code,
+            404,
+        )
+
         deleted = self.client.delete(f"/api/videos/{video_id}/conversations/{conversation_id}")
         self.assertEqual(deleted.status_code, 204, deleted.text)
         self.assertEqual(self.client.get(f"/api/videos/{video_id}/conversations").json(), [])
@@ -603,6 +619,65 @@ class ApiTestCase(unittest.TestCase):
         listed = self.client.get("/api/developer/api-keys").json()
         self.assertNotIn("key", listed[0])
         self.assertEqual(self.client.delete(f"/api/developer/api-keys/{api_key.json()['id']}").status_code, 204)
+
+    def test_api_keys_authenticate_requests_and_stop_after_revocation(self) -> None:
+        created = self.client.post("/api/developer/api-keys", json={"name": "Test integration"})
+        self.assertEqual(created.status_code, 201, created.text)
+        raw_key = created.json()["key"]
+        headers = {"Authorization": f"Bearer {raw_key}"}
+        with patch.dict(os.environ, {"AUTH_MODE": "required"}):
+            authorized = self.client.get("/api/videos", headers=headers)
+            self.assertEqual(authorized.status_code, 200, authorized.text)
+            self.assertEqual(self.client.get("/api/videos").status_code, 401)
+        with main.db() as connection:
+            last_used_at = connection.execute(
+                "SELECT last_used_at FROM api_keys WHERE id = ?", (created.json()["id"],)
+            ).fetchone()["last_used_at"]
+        self.assertIsNotNone(last_used_at)
+        self.assertEqual(self.client.delete(f"/api/developer/api-keys/{created.json()['id']}").status_code, 204)
+        with patch.dict(os.environ, {"AUTH_MODE": "required"}):
+            rejected = self.client.get("/api/videos", headers=headers)
+            self.assertEqual(rejected.status_code, 401)
+
+    def test_workspace_invitation_grants_cross_device_membership(self) -> None:
+        invitation = self.client.post(
+            "/api/workspace/invitations",
+            json={"email": "teammate@example.test", "role": "editor"},
+        )
+        self.assertEqual(invitation.status_code, 201, invitation.text)
+        invited_identity = main.Identity(
+            account_id="teammate-account",
+            workspace_id="teammate-account",
+            email="teammate@example.test",
+            display_name="Teammate",
+        )
+        with patch.dict(os.environ, {"AUTH_MODE": "required"}), patch(
+            "server.main.verify_bearer_token", return_value=invited_identity
+        ):
+            accepted = self.client.post(
+                "/api/workspace/invitations/accept",
+                headers={"Authorization": "Bearer test-session"},
+                json={"token": invitation.json()["token"]},
+            )
+            self.assertEqual(accepted.status_code, 200, accepted.text)
+            self.assertEqual(accepted.json()["role"], "editor")
+            workspace = self.client.get(
+                "/api/workspace",
+                headers={
+                    "Authorization": "Bearer test-session",
+                    "X-Workspace-ID": main.ACTIVE_WORKSPACE_ID,
+                },
+            )
+            self.assertEqual(workspace.status_code, 200, workspace.text)
+            self.assertEqual(workspace.json()["role"], "editor")
+            forbidden = self.client.get(
+                "/api/workspace/invitations",
+                headers={
+                    "Authorization": "Bearer test-session",
+                    "X-Workspace-ID": main.ACTIVE_WORKSPACE_ID,
+                },
+            )
+            self.assertEqual(forbidden.status_code, 403)
 
     def test_private_network_url_is_rejected(self) -> None:
         with patch(

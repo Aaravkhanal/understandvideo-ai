@@ -65,9 +65,9 @@ request process and is not yet connected as a production inference worker.
 | Transcript structure | Transcript lines had no navigation above raw timestamp search. | Transcription now creates deterministic chapters, stores optional speaker labels, and supports saved quote highlights and report export. |
 | Privacy controls | Retention and deletion were all-or-nothing manual actions. | Each video can receive a durable expiry timestamp; expired media and derivatives are permanently removed by API startup or the worker. |
 | Malware defense | Container signatures and decoding caught disguised files but no scanner was connected. | Optional/required ClamAV scanning is now wired through `MALWARE_SCAN_MODE`; required mode fails closed. |
-| Durable quotas | Rate limits disappeared on every restart and were keyed to an IP. | Hourly counters now persist in SQLite and are keyed to the active account and action. |
+| Durable quotas | Rate limits disappeared on every restart and were keyed to an IP. | Hourly counters persist in the configured database and are keyed to the active account and action. |
 | Reliability | Processing depended on the API process and had no browser/CI gate. | A standalone persisted job worker, request timing/queue metrics, desktop/mobile Playwright tests, and GitHub Actions checks are included. |
-| Review and delivery | Review status, comments, clips, and polished reports were absent. | Local review state/assignee/comment APIs, downloadable clips, and styled HTML reports are implemented. |
+| Review and delivery | Review status, comments, clips, and polished reports were absent. | Review state/assignee/comment APIs, downloadable clips, styled HTML reports, conversation-specific exports, workspace invitations, and working API-key authentication are implemented. |
 
 ## Phase 1 — Make analysis real and durable
 

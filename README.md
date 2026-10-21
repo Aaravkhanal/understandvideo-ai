@@ -108,8 +108,9 @@ available instead of inventing an answer.
 - ClamAV scanning is enforced only when `MALWARE_SCAN_MODE=required`. The supplied
   production stack runs decoding in a constrained worker container; stronger
   per-file sandboxing can be added with short-lived jobs on the deployment platform.
-- Team invitations and semantic embeddings
-  integration remain deployment work. Signed webhooks automatically fan out
+- Semantic embeddings remain deployment work. Workspace invitations, API-key
+  authentication, and cross-workspace membership selection are connected.
+  Signed webhooks automatically fan out
   video-ready, import-failed, and review-updated events with bounded retries.
   Local API-key lifecycle and signed webhook registration/test delivery are available.
 
@@ -319,6 +320,13 @@ it—inject it into the API/worker through the deployment secret manager.
 
 The browser reads public limits from `/api/config`, so UI labels and validation
 stay aligned with server configuration.
+
+Programmatic clients can create a one-time-visible key at
+`POST /api/developer/api-keys` and send it as `Authorization: Bearer uv_…`.
+Invited teammates can accept a seven-day invitation and select that workspace
+with the `X-Workspace-ID` header. Revoked keys and expired invitations fail
+closed. Conversation-specific exports use the existing export endpoint with a
+`conversation_id` query parameter.
 
 For process isolation, start `npm run dev:worker`, set `VIDEO_WORKER_URL` on the
 API process, and give both processes the same `VIDEO_WORKER_TOKEN`. The worker

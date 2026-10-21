@@ -200,6 +200,23 @@ class ApiKeyCreateRequest(BaseModel):
     name: str = Field(min_length=1, max_length=80)
 
 
+class InvitationCreateRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=254)
+    role: str = Field(default="viewer", pattern="^(viewer|editor)$")
+
+    @field_validator("email")
+    @classmethod
+    def normalize_email(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if "@" not in normalized:
+            raise ValueError("Enter a valid email address")
+        return normalized
+
+
+class InvitationAcceptRequest(BaseModel):
+    token: str = Field(min_length=20, max_length=200)
+
+
 class WebhookCreateRequest(BaseModel):
     url: HttpUrl
     events: list[str] = Field(min_length=1, max_length=10)
@@ -216,6 +233,39 @@ class WebhookCreateRequest(BaseModel):
 
 def db() -> Iterator[Any]:
     return connect(DATABASE)
+
+
+def verify_api_key(request: Request) -> Identity | None:
+    authorization = request.headers.get("authorization", "")
+    if not authorization.startswith("Bearer uv_"):
+        return None
+    raw_key = authorization.removeprefix("Bearer ").strip()
+    key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
+    with db() as connection:
+        record = connection.execute(
+            """
+            SELECT api_keys.id, api_keys.workspace_id, workspaces.owner_account_id,
+                   accounts.email, accounts.display_name
+            FROM api_keys
+            JOIN workspaces ON workspaces.id = api_keys.workspace_id
+            JOIN accounts ON accounts.id = workspaces.owner_account_id
+            WHERE api_keys.key_hash = ? AND api_keys.revoked_at IS NULL
+            """,
+            (key_hash,),
+        ).fetchone()
+        if record:
+            connection.execute(
+                "UPDATE api_keys SET last_used_at = ? WHERE id = ?",
+                (int(time.time()), record["id"]),
+            )
+    if not record:
+        raise HTTPException(status_code=401, detail="The API key is invalid or revoked")
+    return Identity(
+        account_id=record["owner_account_id"],
+        workspace_id=record["workspace_id"],
+        email=record["email"],
+        display_name=record["display_name"],
+    )
 
 
 def storage() -> LocalStorage:
@@ -438,6 +488,19 @@ def initialize() -> None:
               revoked_at INTEGER,
               FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
             );
+            CREATE TABLE IF NOT EXISTS workspace_invitations (
+              id TEXT PRIMARY KEY,
+              workspace_id TEXT NOT NULL,
+              email TEXT NOT NULL,
+              role TEXT NOT NULL,
+              token_hash TEXT NOT NULL UNIQUE,
+              invited_by TEXT NOT NULL,
+              created_at INTEGER NOT NULL,
+              expires_at INTEGER NOT NULL,
+              accepted_at INTEGER,
+              FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE,
+              FOREIGN KEY (invited_by) REFERENCES accounts(id) ON DELETE CASCADE
+            );
             CREATE TABLE IF NOT EXISTS webhook_subscriptions (
               id TEXT PRIMARY KEY,
               workspace_id TEXT NOT NULL,
@@ -470,6 +533,8 @@ def initialize() -> None:
               ON share_links(video_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_import_jobs_workspace_created
               ON import_jobs(workspace_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_workspace_invitations_workspace_created
+              ON workspace_invitations(workspace_id, created_at DESC);
             """
         )
         now = int(time.time())
@@ -601,6 +666,35 @@ def ensure_identity(identity: Identity) -> None:
         )
 
 
+def select_workspace(identity: Identity, requested_workspace_id: str | None) -> Identity:
+    if not requested_workspace_id or requested_workspace_id == identity.workspace_id:
+        return identity
+    with db() as connection:
+        membership = connection.execute(
+            "SELECT 1 FROM workspace_members WHERE workspace_id = ? AND account_id = ?",
+            (requested_workspace_id, identity.account_id),
+        ).fetchone()
+    if not membership:
+        raise HTTPException(status_code=403, detail="You do not have access to this workspace")
+    return Identity(
+        account_id=identity.account_id,
+        workspace_id=requested_workspace_id,
+        email=identity.email,
+        display_name=identity.display_name,
+    )
+
+
+def require_workspace_role(*allowed_roles: str) -> str:
+    with db() as connection:
+        membership = connection.execute(
+            "SELECT role FROM workspace_members WHERE workspace_id = ? AND account_id = ?",
+            (active_workspace_id(), active_account_id()),
+        ).fetchone()
+    if not membership or membership["role"] not in allowed_roles:
+        raise HTTPException(status_code=403, detail="Your workspace role does not allow this action")
+    return membership["role"]
+
+
 @app.middleware("http")
 async def authenticate_request(request: Request, call_next):
     public_path = (
@@ -611,7 +705,7 @@ async def authenticate_request(request: Request, call_next):
     identity = None
     if not public_path or request.headers.get("authorization"):
         try:
-            identity = verify_bearer_token(request)
+            identity = verify_api_key(request) or verify_bearer_token(request)
         except HTTPException as exc:
             return Response(
                 content=json.dumps({"detail": exc.detail}),
@@ -624,6 +718,8 @@ async def authenticate_request(request: Request, call_next):
     try:
         if identity:
             ensure_identity(identity)
+            identity = select_workspace(identity, request.headers.get("x-workspace-id"))
+            request_identity.set(identity)
         return await call_next(request)
     finally:
         request_identity.reset(token)
@@ -1300,8 +1396,88 @@ def current_workspace() -> dict:
     return {**dict(workspace), "mode": "supabase" if using_postgres() else "local-development"}
 
 
+@app.get("/api/workspace/invitations")
+def list_workspace_invitations() -> list[dict]:
+    require_workspace_role("owner")
+    with db() as connection:
+        rows = connection.execute(
+            """
+            SELECT id, email, role, created_at, expires_at, accepted_at
+            FROM workspace_invitations
+            WHERE workspace_id = ? ORDER BY created_at DESC
+            """,
+            (active_workspace_id(),),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+@app.post("/api/workspace/invitations", status_code=201)
+def create_workspace_invitation(payload: InvitationCreateRequest) -> dict:
+    require_workspace_role("owner")
+    raw_token = "uvi_" + secrets.token_urlsafe(32)
+    now = int(time.time())
+    invitation_id = uuid.uuid4().hex
+    with db() as connection:
+        connection.execute(
+            """
+            INSERT INTO workspace_invitations
+              (id, workspace_id, email, role, token_hash, invited_by, created_at, expires_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                invitation_id,
+                active_workspace_id(),
+                payload.email,
+                payload.role,
+                hashlib.sha256(raw_token.encode()).hexdigest(),
+                active_account_id(),
+                now,
+                now + 7 * 86400,
+            ),
+        )
+    return {
+        "id": invitation_id,
+        "email": payload.email,
+        "role": payload.role,
+        "expires_at": now + 7 * 86400,
+        "token": raw_token,
+        "notice": "Share this invitation token securely. It will not be shown again.",
+    }
+
+
+@app.post("/api/workspace/invitations/accept")
+def accept_workspace_invitation(payload: InvitationAcceptRequest) -> dict:
+    identity = request_identity.get()
+    if not identity or not identity.email:
+        raise HTTPException(status_code=401, detail="Sign in with the invited email address")
+    now = int(time.time())
+    token_hash = hashlib.sha256(payload.token.encode()).hexdigest()
+    with db() as connection:
+        invitation = connection.execute(
+            """
+            SELECT id, workspace_id, email, role, expires_at, accepted_at
+            FROM workspace_invitations WHERE token_hash = ?
+            """,
+            (token_hash,),
+        ).fetchone()
+        if not invitation or invitation["accepted_at"] is not None or invitation["expires_at"] <= now:
+            raise HTTPException(status_code=404, detail="Invitation is invalid or expired")
+        if invitation["email"].lower() != identity.email.lower():
+            raise HTTPException(status_code=403, detail="This invitation belongs to a different email address")
+        connection.execute(
+            "INSERT OR IGNORE INTO workspace_members (workspace_id, account_id, role, created_at) VALUES (?, ?, ?, ?)",
+            (invitation["workspace_id"], identity.account_id, invitation["role"], now),
+        )
+        connection.execute(
+            "UPDATE workspace_invitations SET accepted_at = ? WHERE id = ?",
+            (now, invitation["id"]),
+        )
+    return {"workspace_id": invitation["workspace_id"], "role": invitation["role"]}
+
+
 @app.get("/api/developer/api-keys")
 def list_api_keys() -> list[dict]:
+    require_workspace_role("owner")
     with db() as connection:
         rows = connection.execute(
             "SELECT id, name, key_prefix, created_at, last_used_at, revoked_at FROM api_keys WHERE workspace_id = ? ORDER BY created_at DESC",
@@ -1312,6 +1488,7 @@ def list_api_keys() -> list[dict]:
 
 @app.post("/api/developer/api-keys", status_code=201)
 def create_api_key(payload: ApiKeyCreateRequest) -> dict:
+    require_workspace_role("owner")
     raw_key = "uv_" + secrets.token_urlsafe(32)
     record = {
         "id": uuid.uuid4().hex,
@@ -1329,6 +1506,7 @@ def create_api_key(payload: ApiKeyCreateRequest) -> dict:
 
 @app.delete("/api/developer/api-keys/{key_id}", status_code=204)
 def revoke_api_key(key_id: str) -> Response:
+    require_workspace_role("owner")
     with db() as connection:
         changed = connection.execute(
             "UPDATE api_keys SET revoked_at = ? WHERE id = ? AND workspace_id = ? AND revoked_at IS NULL",
@@ -1341,6 +1519,7 @@ def revoke_api_key(key_id: str) -> Response:
 
 @app.get("/api/developer/webhooks")
 def list_webhooks() -> list[dict]:
+    require_workspace_role("owner")
     with db() as connection:
         rows = connection.execute(
             "SELECT id, url, events, created_at, disabled_at FROM webhook_subscriptions WHERE workspace_id = ? ORDER BY created_at DESC",
@@ -1351,6 +1530,7 @@ def list_webhooks() -> list[dict]:
 
 @app.post("/api/developer/webhooks", status_code=201)
 def create_webhook(payload: WebhookCreateRequest) -> dict:
+    require_workspace_role("owner")
     url = str(payload.url)
     validate_public_https_url(url)
     webhook_id = uuid.uuid4().hex
@@ -1402,6 +1582,7 @@ def emit_webhook_event(workspace_id: str, event: str, data: dict) -> int:
 
 @app.post("/api/developer/webhooks/{webhook_id}/test")
 def test_webhook(webhook_id: str) -> dict:
+    require_workspace_role("owner")
     with db() as connection:
         hook = connection.execute(
             "SELECT url, signing_secret FROM webhook_subscriptions WHERE id = ? AND workspace_id = ? AND disabled_at IS NULL",
@@ -1423,6 +1604,7 @@ def test_webhook(webhook_id: str) -> dict:
 
 @app.delete("/api/developer/webhooks/{webhook_id}", status_code=204)
 def disable_webhook(webhook_id: str) -> Response:
+    require_workspace_role("owner")
     with db() as connection:
         changed = connection.execute(
             "UPDATE webhook_subscriptions SET disabled_at = ? WHERE id = ? AND workspace_id = ? AND disabled_at IS NULL",
@@ -2184,7 +2366,8 @@ def delete_annotation(video_id: str, annotation_id: str) -> Response:
 def export_video_notes(
     video_id: str,
     format: str = Query(default="markdown", pattern="^(markdown|json|html)$"),
-    template: str = Query(default="brief", pattern="^(brief|research|review)$"),
+    template: str = Query(default="brief", pattern="^(brief|research|review|support-ticket|content-brief)$"),
+    conversation_id: str | None = Query(default=None, max_length=64, pattern=r"^[a-zA-Z0-9_-]+$"),
 ) -> Response:
     video = video_record(video_id)
     with db() as connection:
@@ -2210,6 +2393,10 @@ def export_video_notes(
             "SELECT id, title, created_at, updated_at FROM conversations WHERE video_id = ? ORDER BY updated_at DESC",
             (video_id,),
         ).fetchall()]
+        if conversation_id:
+            conversations = [item for item in conversations if item["id"] == conversation_id]
+            if not conversations:
+                raise HTTPException(status_code=404, detail="Conversation not found")
         for conversation in conversations:
             conversation["messages"] = [dict(row) for row in connection.execute(
                 "SELECT role, content, created_at FROM messages WHERE video_id = ? AND conversation_id = ? ORDER BY created_at, rowid",
