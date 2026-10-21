@@ -24,6 +24,7 @@ from typing import AsyncIterator, Any, Iterator
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, RedirectResponse, Response, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, HttpUrl, field_validator
 
 from server.analysis import AnalysisError, extract_scene_thumbnails
@@ -699,6 +700,7 @@ def require_workspace_role(*allowed_roles: str) -> str:
 async def authenticate_request(request: Request, call_next):
     public_path = (
         request.method == "OPTIONS"
+        or not request.url.path.startswith("/api")
         or request.url.path in {"/api/health", "/api/ready", "/api/config"}
         or request.url.path.startswith("/api/shares/")
     )
@@ -2819,3 +2821,11 @@ def messages(video_id: str, conversation_id: str | None = Query(default=None, ma
                 (video_id,),
             ).fetchall()
     return [dict(record) for record in records]
+
+
+frontend_directory = os.getenv("SERVE_FRONTEND_DIR", "").strip()
+if frontend_directory:
+    frontend_path = Path(frontend_directory).expanduser().resolve()
+    if not frontend_path.is_dir():
+        raise RuntimeError(f"SERVE_FRONTEND_DIR does not exist: {frontend_path}")
+    app.mount("/", StaticFiles(directory=frontend_path, html=True), name="frontend")

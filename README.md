@@ -119,6 +119,10 @@ The prioritized work is tracked in the
 [product roadmap](docs/PLATFORM_ROADMAP.md).
 The staging and public-launch procedure is in the
 [production runbook](docs/PRODUCTION_RUNBOOK.md).
+The root [Render blueprint](render.yaml) provides a no-card staging deployment.
+It intentionally keeps malware scanning best-effort and uses a small local
+speech model because Render's free instance has limited memory. Use the Docker
+Compose production stack for a public production launch.
 
 ---
 

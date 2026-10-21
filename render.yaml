@@ -1,0 +1,68 @@
+services:
+  - type: keyvalue
+    name: understandvideo-cache
+    plan: free
+    region: oregon
+    ipAllowList: []
+    maxmemoryPolicy: noeviction
+
+  - type: web
+    name: understandvideo-ai
+    runtime: docker
+    plan: free
+    region: oregon
+    dockerfilePath: ./docker/render.Dockerfile
+    healthCheckPath: /api/ready
+    autoDeployTrigger: commit
+    envVars:
+      - key: VITE_SUPABASE_URL
+        value: https://gglxzpndiuslgwrvywkl.supabase.co
+      - key: VITE_SUPABASE_PUBLISHABLE_KEY
+        sync: false
+      - key: SUPABASE_URL
+        value: https://gglxzpndiuslgwrvywkl.supabase.co
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: understandvideo-cache
+          property: connectionString
+      - key: VIDEO_WORKER_TOKEN
+        generateValue: true
+      - key: AUTH_MODE
+        value: required
+      - key: OIDC_ISSUER_URL
+        value: https://gglxzpndiuslgwrvywkl.supabase.co/auth/v1
+      - key: OIDC_AUDIENCE
+        value: authenticated
+      - key: OBJECT_STORAGE_PROVIDER
+        value: supabase
+      - key: OBJECT_STORAGE_BUCKET
+        value: understandvideo-private
+      - key: OBJECT_STORAGE_ENDPOINT
+        value: https://gglxzpndiuslgwrvywkl.supabase.co/storage/v1
+      - key: UPLOAD_ROOT
+        value: /tmp/understandvideo-uploads
+      - key: MALWARE_SCAN_MODE
+        value: optional
+      - key: RUN_BACKGROUND_JOBS
+        value: "true"
+      - key: DEFAULT_RETENTION_DAYS
+        value: "90"
+      - key: MAX_UPLOAD_BYTES
+        value: "104857600"
+      - key: MAX_REMOTE_DURATION_SECONDS
+        value: "3600"
+      - key: REMOTE_IMPORT_TIMEOUT_SECONDS
+        value: "180"
+      - key: TRANSCRIPTION_PROVIDER
+        value: local
+      - key: LOCAL_WHISPER_MODEL
+        value: tiny
+      - key: LOCAL_SPEAKER_DIARIZATION
+        value: "false"
+      - key: CORS_ORIGINS
+        value: https://understandvideo-ai.onrender.com
