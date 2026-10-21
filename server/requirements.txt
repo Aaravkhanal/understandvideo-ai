@@ -10,5 +10,5 @@ faster-whisper>=1.2,<2
 pyannote.audio>=4,<5
 # faster-whisper 1.2 still calls a PyAV option removed in newer releases.
 av>=14,<17
-redis>=5,<7
+redis>=8.1.0,<9
 psycopg[binary]>=3.2,<4
