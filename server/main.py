@@ -32,7 +32,7 @@ from server.auth import Identity, auth_mode, verify_bearer_token
 from server.database import connect, using_postgres
 from server.inference import answer_video_question, inference_mode, is_demo_video
 from server.job_queue import notify_jobs, redis_client
-from server.remote_import import RemoteImportCancelled, RemoteImportError, import_remote_video, platform_hosts, validate_public_https_url
+from server.remote_import import RemoteImportCancelled, RemoteImportError, import_remote_video, platform_hosts, remote_source_details, validate_public_https_url
 from server.storage import LocalStorage, StorageError, SupabaseStorage
 from server.transcription import NoAudioTrack, TranscriptionError, TranscriptionUnavailable, transcribe_video
 
@@ -448,6 +448,11 @@ def initialize() -> None:
               error TEXT,
               cancel_requested INTEGER NOT NULL DEFAULT 0,
               attempts INTEGER NOT NULL DEFAULT 0,
+              platform TEXT,
+              downloaded_bytes INTEGER,
+              total_bytes INTEGER,
+              speed_bps REAL,
+              eta_seconds INTEGER,
               created_at INTEGER NOT NULL,
               updated_at INTEGER NOT NULL,
               FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE,
@@ -575,6 +580,15 @@ def initialize() -> None:
         import_columns = {row["name"] for row in connection.execute("PRAGMA table_info(import_jobs)")}
         if "attempts" not in import_columns:
             connection.execute("ALTER TABLE import_jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
+        for column, definition in {
+            "platform": "TEXT",
+            "downloaded_bytes": "INTEGER",
+            "total_bytes": "INTEGER",
+            "speed_bps": "REAL",
+            "eta_seconds": "INTEGER",
+        }.items():
+            if column not in import_columns:
+                connection.execute(f"ALTER TABLE import_jobs ADD COLUMN {column} {definition}")
         scene_columns = {row["name"] for row in connection.execute("PRAGMA table_info(scenes)")}
         if "detection_method" not in scene_columns:
             connection.execute("ALTER TABLE scenes ADD COLUMN detection_method TEXT NOT NULL DEFAULT 'uniform-reference'")
@@ -1174,17 +1188,26 @@ def run_import_job(import_id: str) -> None:
             ).fetchone()
         return not record or bool(record["cancel_requested"])
 
-    def update_progress(progress: int) -> None:
+    def update_progress(progress: int, **metrics) -> None:
         nonlocal last_progress
         progress = max(last_progress, min(95, int(progress)))
         if progress <= last_progress:
             return
         last_progress = progress
-        detail = "Downloading video" if progress < 90 else "Checking playback"
+        detail = metrics.get("stage") or ("Downloading video" if progress < 90 else "Checking playback")
         with db() as connection:
             connection.execute(
-                "UPDATE import_jobs SET progress = ?, detail = ?, updated_at = ? WHERE id = ?",
-                (progress, detail, int(time.time()), import_id),
+                """
+                UPDATE import_jobs
+                SET progress = ?, detail = ?, downloaded_bytes = COALESCE(?, downloaded_bytes),
+                    total_bytes = COALESCE(?, total_bytes), speed_bps = COALESCE(?, speed_bps),
+                    eta_seconds = COALESCE(?, eta_seconds), updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    progress, detail, metrics.get("downloaded_bytes"), metrics.get("total_bytes"),
+                    metrics.get("speed_bps"), metrics.get("eta_seconds"), int(time.time()), import_id,
+                ),
             )
 
     try:
@@ -1769,20 +1792,32 @@ async def import_video_url(request: Request, background_tasks: BackgroundTasks, 
 @app.post("/api/imports", status_code=202)
 def create_import_job(request: Request, background_tasks: BackgroundTasks, payload: UrlImportRequest) -> dict:
     enforce_rate_limit("upload", limit=UPLOADS_PER_HOUR)
+    try:
+        source = remote_source_details(str(payload.url))
+    except RemoteImportError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     import_id = uuid.uuid4().hex
     now = int(time.time())
     with db() as connection:
         connection.execute(
             """
             INSERT INTO import_jobs
-              (id, workspace_id, source_url, status, progress, detail, video_id, error, cancel_requested, created_at, updated_at)
-            VALUES (?, ?, ?, 'queued', 0, 'Waiting to start', NULL, NULL, 0, ?, ?)
+              (id, workspace_id, source_url, status, progress, detail, video_id, error, cancel_requested, platform, created_at, updated_at)
+            VALUES (?, ?, ?, 'queued', 0, 'Waiting to start', NULL, NULL, 0, ?, ?, ?)
             """,
-            (import_id, active_workspace_id(), str(payload.url), now, now),
+            (import_id, active_workspace_id(), str(payload.url), source["platform"], now, now),
         )
     notify_jobs()
     background_tasks.add_task(run_import_job, import_id)
-    return {"id": import_id, "status": "queued", "progress": 0, "detail": "Waiting to start"}
+    return {"id": import_id, "status": "queued", "progress": 0, "detail": "Waiting to start", **source}
+
+
+@app.post("/api/imports/check")
+def check_import_link(payload: UrlImportRequest) -> dict:
+    try:
+        return {"supported": True, **remote_source_details(str(payload.url))}
+    except RemoteImportError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @app.get("/api/imports")
@@ -1791,7 +1826,8 @@ def list_import_jobs(active: bool = False, limit: int = Query(default=10, ge=1, 
         if active:
             records = connection.execute(
                 """
-                SELECT id, source_url, status, progress, detail, video_id, error, created_at, updated_at
+                SELECT id, source_url, status, progress, detail, video_id, error, platform,
+                       downloaded_bytes, total_bytes, speed_bps, eta_seconds, attempts, created_at, updated_at
                 FROM import_jobs
                 WHERE workspace_id = ? AND status IN ('queued', 'processing')
                 ORDER BY created_at DESC LIMIT ?
@@ -1801,7 +1837,8 @@ def list_import_jobs(active: bool = False, limit: int = Query(default=10, ge=1, 
         else:
             records = connection.execute(
                 """
-                SELECT id, source_url, status, progress, detail, video_id, error, created_at, updated_at
+                SELECT id, source_url, status, progress, detail, video_id, error, platform,
+                       downloaded_bytes, total_bytes, speed_bps, eta_seconds, attempts, created_at, updated_at
                 FROM import_jobs WHERE workspace_id = ? ORDER BY created_at DESC LIMIT ?
                 """,
                 (active_workspace_id(), limit),
@@ -1814,7 +1851,8 @@ def import_job(import_id: str) -> dict:
     with db() as connection:
         job = connection.execute(
             """
-            SELECT id, source_url, status, progress, detail, video_id, error, created_at, updated_at
+            SELECT id, source_url, status, progress, detail, video_id, error, platform,
+                   downloaded_bytes, total_bytes, speed_bps, eta_seconds, attempts, created_at, updated_at
             FROM import_jobs WHERE id = ? AND workspace_id = ?
             """,
             (import_id, active_workspace_id()),
@@ -1872,7 +1910,8 @@ def retry_import_job(import_id: str, background_tasks: BackgroundTasks) -> dict:
             """
             UPDATE import_jobs
             SET status = 'queued', progress = 0, detail = 'Waiting to retry', video_id = NULL,
-                error = NULL, cancel_requested = 0, updated_at = ?
+                error = NULL, cancel_requested = 0, downloaded_bytes = NULL, total_bytes = NULL,
+                speed_bps = NULL, eta_seconds = NULL, updated_at = ?
             WHERE id = ?
             """,
             (int(time.time()), import_id),

@@ -59,6 +59,8 @@ available instead of inventing an answer.
 
 ### Working today
 
+- Demo-before-sign-in onboarding with a three-step introduction and a complete
+  interactive workspace preview before users provide an email address.
 - Premium responsive workspace with upload, playback, timeline navigation,
   overview, library search, and streamed answers.
 - Public-link import for YouTube, Instagram, TikTok, Vimeo, X, Facebook,
@@ -66,7 +68,12 @@ available instead of inventing an answer.
   preselect a browser-compatible MP4 within the configured size limit and
   verify that the finished file contains a decodable video track.
 - Durable background link imports with real progress, cancellation, retry, and
-  automatic UI recovery after a browser refresh.
+  automatic UI recovery after a browser refresh. Import status includes the
+  detected platform, transferred and total bytes, speed, ETA, retry attempt,
+  and processing stage.
+- Preflight link diagnostics reject unsupported websites before creating a
+  library item and explain public, login-only, private, regional, live, and
+  DRM-related limitations in plain language.
 - One-click repair for older failed link imports, preserving the library item
   and original URL while replacing unusable media and rebuilding its timeline.
 - Durable local analysis jobs that detect strong visual cuts, fill sparse

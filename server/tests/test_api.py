@@ -16,6 +16,7 @@ from server.remote_import import (
     RemoteMedia,
     choose_platform_format,
     download_platform_video,
+    remote_source_details,
     validate_public_https_url,
 )
 from server.transcription import TranscriptSegment
@@ -700,6 +701,21 @@ class ApiTestCase(unittest.TestCase):
                     1024,
                     60,
                 )
+
+    def test_import_preflight_identifies_supported_platforms_and_direct_files(self) -> None:
+        with patch("server.remote_import.public_addresses", return_value=["93.184.216.34"]):
+            youtube = remote_source_details("https://www.youtube.com/watch?v=example")
+            direct = remote_source_details("https://media.example.com/clip.mp4")
+            self.assertEqual(youtube["platform"], "YouTube")
+            self.assertEqual(youtube["kind"], "platform")
+            self.assertEqual(direct["platform"], "Direct video")
+            self.assertEqual(direct["kind"], "direct")
+
+    def test_import_preflight_rejects_unknown_web_pages_before_queueing(self) -> None:
+        with patch("server.remote_import.public_addresses", return_value=["93.184.216.34"]):
+            response = self.client.post("/api/imports/check", json={"url": "https://example.com/watch/123"})
+        self.assertEqual(response.status_code, 422)
+        self.assertIn("not supported", response.json()["detail"])
 
 
 if __name__ == "__main__":

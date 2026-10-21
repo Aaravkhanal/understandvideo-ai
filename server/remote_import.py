@@ -50,6 +50,44 @@ class RemoteImportCancelled(RemoteImportError):
     pass
 
 
+PLATFORM_LABELS = {
+    "youtube.com": "YouTube",
+    "youtu.be": "YouTube",
+    "instagram.com": "Instagram",
+    "tiktok.com": "TikTok",
+    "vimeo.com": "Vimeo",
+    "twitter.com": "X",
+    "x.com": "X",
+    "facebook.com": "Facebook",
+    "fb.watch": "Facebook",
+    "twitch.tv": "Twitch",
+    "reddit.com": "Reddit",
+    "dailymotion.com": "Dailymotion",
+}
+
+
+def remote_source_details(url: str) -> dict:
+    """Validate a link before queueing work and return user-facing support details."""
+    parsed = validate_public_https_url(url)
+    host = normalized_host(parsed.hostname or "")
+    if is_direct_video_url(parsed):
+        return {
+            "platform": "Direct video",
+            "kind": "direct",
+            "message": "Direct public video file detected. The server will verify its type and playable video track.",
+        }
+    if not matches_host(host, platform_hosts()):
+        raise RemoteImportError(
+            "This website is not supported yet. Use YouTube, Instagram, TikTok, Vimeo, X, Facebook, Twitch, Reddit, Dailymotion, or a direct HTTPS video file."
+        )
+    label = next((name for domain, name in PLATFORM_LABELS.items() if host == domain or host.endswith(f".{domain}")), "Public video")
+    return {
+        "platform": label,
+        "kind": "platform",
+        "message": f"{label} link detected. It must be public, available without login, and not DRM-protected.",
+    }
+
+
 @dataclass(frozen=True)
 class RemoteMedia:
     path: Path
@@ -220,7 +258,7 @@ def download_direct_video(
     video_id: str,
     max_bytes: int,
     deadline: float | None = None,
-    progress_callback: Callable[[int], None] | None = None,
+    progress_callback: Callable[..., None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
 ) -> RemoteMedia:
     parsed = validate_public_https_url(url)
@@ -251,6 +289,7 @@ def download_direct_video(
             suffix = MIME_EXTENSIONS.get(mime_type, ".mp4")
         target = target_dir / f"{video_id}{suffix}"
         size = 0
+        started_at = time.monotonic()
         try:
             with target.open("wb") as output:
                 while chunk := response.read(1024 * 1024):
@@ -264,7 +303,16 @@ def download_direct_video(
                     output.write(chunk)
                     if progress_callback:
                         total = int(content_length) if content_length else max_bytes
-                        progress_callback(min(90, 10 + int(size / max(total, 1) * 80)))
+                        elapsed = max(time.monotonic() - started_at, 0.001)
+                        speed = int(size / elapsed)
+                        progress_callback(
+                            min(90, 10 + int(size / max(total, 1) * 80)),
+                            downloaded_bytes=size,
+                            total_bytes=int(content_length) if content_length else None,
+                            speed_bps=speed,
+                            eta_seconds=max(0, int((total - size) / speed)) if content_length and speed else None,
+                            stage="Downloading direct video",
+                        )
         except Exception:
             target.unlink(missing_ok=True)
             raise
@@ -283,7 +331,7 @@ def download_platform_video(
     max_bytes: int,
     max_duration_seconds: int,
     deadline: float | None = None,
-    progress_callback: Callable[[int], None] | None = None,
+    progress_callback: Callable[..., None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
 ) -> RemoteMedia:
     parsed = validate_public_https_url(url)
@@ -306,6 +354,7 @@ def download_platform_video(
         return None
 
     highest_progress = 10
+    started_at = time.monotonic()
 
     def enforce_deadline(status: dict) -> None:
         nonlocal highest_progress
@@ -319,7 +368,16 @@ def download_platform_video(
             if total:
                 highest_progress = max(highest_progress, min(88, 15 + int(downloaded / total * 70)))
                 if progress_callback:
-                    progress_callback(highest_progress)
+                    elapsed = max(time.monotonic() - started_at, 0.001)
+                    speed = int(downloaded / elapsed)
+                    progress_callback(
+                        highest_progress,
+                        downloaded_bytes=downloaded,
+                        total_bytes=total,
+                        speed_bps=speed,
+                        eta_seconds=max(0, int((total - downloaded) / speed)) if speed else None,
+                        stage="Downloading platform video",
+                    )
 
     output_template = str(target_dir / f"{video_id}.%(ext)s")
     base_options = {
@@ -418,7 +476,7 @@ def import_remote_video(
     max_bytes: int,
     max_duration_seconds: int,
     timeout_seconds: int,
-    progress_callback: Callable[[int], None] | None = None,
+    progress_callback: Callable[..., None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
 ) -> RemoteMedia:
     deadline = time.monotonic() + timeout_seconds

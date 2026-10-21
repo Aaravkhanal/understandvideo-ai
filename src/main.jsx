@@ -19,6 +19,36 @@ const SUPABASE_KEY = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY?.trim();
 const supabase = SUPABASE_URL && SUPABASE_KEY ? createClient(SUPABASE_URL, SUPABASE_KEY) : null;
 const nativeFetch = window.fetch.bind(window);
 
+function formatBytes(value) {
+  if (!Number.isFinite(Number(value)) || Number(value) <= 0) return '';
+  const units = ['B', 'KB', 'MB', 'GB'];
+  let amount = Number(value);
+  let unit = 0;
+  while (amount >= 1024 && unit < units.length - 1) { amount /= 1024; unit += 1; }
+  return `${amount >= 10 || unit === 0 ? amount.toFixed(0) : amount.toFixed(1)} ${units[unit]}`;
+}
+
+function formatEta(value) {
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds) || seconds < 0) return '';
+  if (seconds < 60) return `${Math.max(1, Math.round(seconds))}s remaining`;
+  return `${Math.ceil(seconds / 60)}m remaining`;
+}
+
+function importMetrics(job) {
+  if (!job || ['failed', 'cancelled'].includes(job.status)) return '';
+  const parts = [];
+  const downloaded = formatBytes(job.downloaded_bytes);
+  const total = formatBytes(job.total_bytes);
+  if (downloaded) parts.push(total ? `${downloaded} of ${total}` : downloaded);
+  const speed = formatBytes(job.speed_bps);
+  if (speed) parts.push(`${speed}/s`);
+  const eta = formatEta(job.eta_seconds);
+  if (eta) parts.push(eta);
+  if (job.attempts > 1) parts.push(`attempt ${job.attempts}`);
+  return parts.join(' · ');
+}
+
 async function apiFetch(input, init = {}) {
   const headers = new Headers(init.headers || {});
   if (supabase) {
@@ -102,12 +132,12 @@ function Logo() {
   return <div className="brand"><span className="brand-mark"><i /><i /><i /></span><span>understandvideo</span></div>;
 }
 
-function WorkspaceApp() {
-  const [page, setPage] = useState('home');
+function WorkspaceApp({ previewMode = false, onRequestSignIn = () => {} }) {
+  const [page, setPage] = useState(previewMode ? 'studio' : 'home');
   const [panel, setPanel] = useState('ask');
-  const [videoUrl, setVideoUrl] = useState('');
+  const [videoUrl, setVideoUrl] = useState(previewMode ? DEMO_VIDEO_PATH : '');
   const [videoId, setVideoId] = useState('');
-  const [sourceType, setSourceType] = useState('none');
+  const [sourceType, setSourceType] = useState(previewMode ? 'demo' : 'none');
   const [sourceUrl, setSourceUrl] = useState('');
   const [conversationId, setConversationId] = useState('');
   const [conversations, setConversations] = useState([]);
@@ -120,7 +150,7 @@ function WorkspaceApp() {
   const [currentTime, setCurrentTime] = useState(0);
   const [processing, setProcessing] = useState(false);
   const [progress, setProgress] = useState(0);
-  const [analysisStatus, setAnalysisStatus] = useState('idle');
+  const [analysisStatus, setAnalysisStatus] = useState(previewMode ? 'ready' : 'idle');
   const [analysisError, setAnalysisError] = useState('');
   const [persistedScenes, setPersistedScenes] = useState([]);
   const [transcriptStatus, setTranscriptStatus] = useState('idle');
@@ -147,6 +177,7 @@ function WorkspaceApp() {
   const [urlInput, setUrlInput] = useState('');
   const [importingUrl, setImportingUrl] = useState(false);
   const [importJob, setImportJob] = useState(null);
+  const [importHint, setImportHint] = useState(null);
   const [repairingImport, setRepairingImport] = useState(false);
   const [editingVideoId, setEditingVideoId] = useState('');
   const [editingName, setEditingName] = useState('');
@@ -202,6 +233,30 @@ function WorkspaceApp() {
       .catch(() => setApiOnline(false));
     return () => controller.abort();
   }, []);
+  useEffect(() => {
+    if (!urlInput.trim() || importingUrl || previewMode) { setImportHint(null); return undefined; }
+    let parsed;
+    try {
+      parsed = new URL(urlInput.trim());
+      if (parsed.protocol !== 'https:') throw new Error('Use a public HTTPS link');
+    } catch (error) {
+      setImportHint({ supported: false, message: error.message || 'Enter a valid public video link' });
+      return undefined;
+    }
+    setImportHint({ checking: true, message: 'Checking link support…' });
+    const controller = new AbortController();
+    const timeout = setTimeout(() => {
+      apiFetch(`${API_BASE}/api/imports/check`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: parsed.href }), signal: controller.signal
+      }).then(async response => {
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(result.detail || 'This link cannot be imported');
+        setImportHint(result);
+      }).catch(error => { if (error.name !== 'AbortError') setImportHint({ supported: false, message: error.message }); });
+    }, 450);
+    return () => { clearTimeout(timeout); controller.abort(); };
+  }, [urlInput, importingUrl, previewMode]);
   useEffect(() => {
     if (page !== 'library') return undefined;
     const timeout = setTimeout(() => { void refreshLibrary(libraryQuery); }, 250);
@@ -802,6 +857,7 @@ function WorkspaceApp() {
 
   async function importFromUrl(event) {
     event.preventDefault();
+    if (previewMode) { onRequestSignIn(); return; }
     const value = urlInput.trim();
     if (!value || importingUrl) return;
     try {
@@ -1010,6 +1066,8 @@ function WorkspaceApp() {
     onDragLeave: () => setDragging(false),
     onDrop: e => { e.preventDefault(); setDragging(false); loadFile(e.dataTransfer.files[0]); }
   };
+  const openUpload = () => previewMode ? onRequestSignIn() : fileRef.current?.click();
+  const openLibrary = () => previewMode ? onRequestSignIn() : setPage('library');
 
   return <div className="app-shell">
     <aside className="side-rail">
@@ -1017,7 +1075,7 @@ function WorkspaceApp() {
       <nav className="main-nav">
         <button className={page === 'home' ? 'active' : ''} onClick={() => setPage('home')}><Home size={17} /><span>Home</span></button>
         <button className={page === 'studio' ? 'active' : ''} onClick={() => videoUrl ? setPage('studio') : fileRef.current?.click()}><MessageSquareText size={17} /><span>Video chat</span><kbd>⌘K</kbd></button>
-        <button className={page === 'library' ? 'active' : ''} onClick={() => setPage('library')}><Library size={17} /><span>Library</span></button>
+        <button className={page === 'library' ? 'active' : ''} onClick={openLibrary}><Library size={17} /><span>Library</span></button>
       </nav>
       <div className="rail-spacer" />
       <span className="maker-note">Made by Aarav</span>
@@ -1027,7 +1085,7 @@ function WorkspaceApp() {
       <header className="topbar">
         <div className="mobile-brand"><Logo /></div>
         <button className="search-command" onClick={openLibrarySearch}><Search size={15} /><span>Search your videos</span><kbd>⌘ /</kbd></button>
-        <div className="top-actions"><span className={`system-status ${apiOnline ? '' : 'offline'}`}><i />{apiOnline ? 'API connected' : 'Demo mode'}</span><button className="icon-button" onClick={() => setPage('library')} aria-label="Open recent videos"><Clock3 size={17} /></button><button className="new-video" onClick={() => { setPage('home'); requestAnimationFrame(() => urlInputRef.current?.focus()); }}><Plus size={15} />Add video</button></div>
+          <div className="top-actions"><span className={`system-status ${apiOnline ? '' : 'offline'}`}><i />{previewMode ? 'Interactive demo' : apiOnline ? 'API connected' : 'Demo mode'}</span><button className="icon-button" onClick={() => previewMode ? onRequestSignIn() : setPage('library')} aria-label="Open recent videos"><Clock3 size={17} /></button><button className="new-video" onClick={() => { if (previewMode) onRequestSignIn(); else { setPage('home'); requestAnimationFrame(() => urlInputRef.current?.focus()); } }}><Plus size={15} />{previewMode ? 'Sign in to add videos' : 'Add video'}</button></div>
       </header>
 
       {page === 'home' && <main className="home-page">
@@ -1036,7 +1094,7 @@ function WorkspaceApp() {
             <span className="hero-pill">Video understanding, made simple</span>
             <h1>Your video.<br /><em>Ready to answer.</em></h1>
             <p>Upload a video and have a grounded conversation about what happens inside it. Ask follow-ups, understand key moments, and jump to exact timestamps.</p>
-            <div className="hero-actions"><button className="primary-cta" onClick={() => fileRef.current?.click()}><UploadCloud size={17} />Upload a video</button><button className="ghost-cta" onClick={() => urlInputRef.current?.focus()}><Link2 size={15} />Use a link</button><button className="ghost-cta" onClick={loadDemo}><Play size={15} fill="currentColor" />Try demo</button></div>
+            <div className="hero-actions"><button className="primary-cta" onClick={openUpload}><UploadCloud size={17} />Upload a video</button><button className="ghost-cta" onClick={() => previewMode ? onRequestSignIn() : urlInputRef.current?.focus()}><Link2 size={15} />Use a link</button><button className="ghost-cta" onClick={loadDemo}><Play size={15} fill="currentColor" />Try demo</button></div>
             <div className="trust-row"><span><Check size={12} />Video understanding only</span><span><Check size={12} />No video generation</span><span><Check size={12} />Evidence-linked answers</span></div>
           </div>
           <button className="hero-film" onClick={loadDemo} aria-label="Play demo video">
@@ -1053,20 +1111,21 @@ function WorkspaceApp() {
           <input id="video-url" ref={urlInputRef} type="url" inputMode="url" value={urlInput} onChange={event => setUrlInput(event.target.value)} placeholder="https://…" disabled={importingUrl} />
           <button type="submit" disabled={!urlInput.trim() || importingUrl}>{importingUrl ? 'Importing…' : 'Import link'} <ArrowRight size={14} /></button>
         </form>
-        {importJob && importJob.status !== 'ready' && <div className="import-status"><span><strong>{importJob.detail || 'Preparing import'}</strong><small>{importJob.status === 'failed' ? importJob.error : importJob.status === 'cancelled' ? 'The download was stopped.' : `${importJob.progress || 0}% complete`}</small></span>{['queued', 'processing', 'cancelling'].includes(importJob.status) ? <><i><em style={{ width: `${importJob.progress || 0}%` }} /></i><button onClick={cancelImport} disabled={importJob.status === 'cancelling'}>{importJob.status === 'cancelling' ? 'Cancelling…' : 'Cancel'}</button></> : <><button onClick={retryImport}>Retry</button><button onClick={() => setImportJob(null)}>Dismiss</button></>}</div>}
+        {importHint && !importJob && <div className={`import-hint ${importHint.supported === false ? 'unsupported' : ''}`}><strong>{importHint.platform || (importHint.checking ? 'Checking this link' : 'Link support')}</strong><span>{importHint.message}</span></div>}
+        {importJob && importJob.status !== 'ready' && <div className="import-status"><span><strong>{importJob.platform ? `${importJob.platform} · ` : ''}{importJob.detail || 'Preparing import'}</strong><small>{importJob.status === 'failed' ? importJob.error : importJob.status === 'cancelled' ? 'The download was stopped.' : `${importJob.progress || 0}% complete${importMetrics(importJob) ? ` · ${importMetrics(importJob)}` : ''}`}</small></span>{['queued', 'processing', 'cancelling'].includes(importJob.status) ? <><i><em style={{ width: `${importJob.progress || 0}%` }} /></i><button onClick={cancelImport} disabled={importJob.status === 'cancelling'}>{importJob.status === 'cancelling' ? 'Cancelling…' : 'Cancel'}</button></> : <><button onClick={retryImport}>Retry</button><button onClick={() => setImportJob(null)}>Dismiss</button></>}</div>}
 
         <section className={`quick-upload ${dragging ? 'dragging' : ''}`} {...uploadDropHandlers}>
           <div className="upload-badge"><UploadCloud size={20} /></div>
           <div><strong>Drop a video to ask questions about it</strong><span>MP4, MOV, WebM or AVI · up to {formattedUploadLimit}</span></div>
-          <button onClick={() => fileRef.current?.click()}>Browse files <ArrowRight size={14} /></button>
+          <button onClick={openUpload}>Browse files <ArrowRight size={14} /></button>
         </section>
 
         <section className="dashboard-row">
           <div className="recent-section">
-            <div className="section-title"><div><span>YOUR SPACE</span><h2>Recent videos</h2></div><button onClick={() => setPage('library')}>View library <ArrowRight size={13} /></button></div>
+            <div className="section-title"><div><span>YOUR SPACE</span><h2>Recent videos</h2></div><button onClick={openLibrary}>View library <ArrowRight size={13} /></button></div>
             <div className="media-grid">
               <button className="media-card featured" onClick={loadDemo}><div className="thumb"><img src="/demo/scene-runner.jpg" alt="Runner scene thumbnail" /><span className="duration">00:12</span><span className="thumb-play"><Play size={13} fill="currentColor" /></span></div><div className="media-info"><strong>Across the alpine valley</strong><span><i />Analyzed · 4 scenes</span></div></button>
-              <button className="media-card add-card" onClick={() => fileRef.current?.click()}><div><Plus size={21} /></div><strong>Analyze your own video</strong><span>Upload, understand, and ask anything</span></button>
+              <button className="media-card add-card" onClick={openUpload}><div><Plus size={21} /></div><strong>Analyze your own video</strong><span>Upload, understand, and ask anything</span></button>
             </div>
           </div>
           <aside className="insight-card"><span>HOW IT WORKS</span><h3>Every frame becomes searchable context.</h3><p>Scene mapping, timeline-aware answers, and conversation memory work together in one focused space.</p><div className="metric-row"><div><b>4</b><small>scene types</small></div><div><b>&lt;1s</b><small>timestamp jump</small></div><div><b>∞</b><small>follow-ups</small></div></div></aside>
@@ -1101,7 +1160,7 @@ function WorkspaceApp() {
 
       {page === 'studio' && <main className="studio-page">
         <section className="studio-video">
-          <div className="studio-heading"><div><span className="overline">VIDEO UNDERSTANDING</span><h1>{fileName}</h1></div><div className="studio-meta"><span><i />{processing ? `Mapping moments · ${progress}%` : analysisStatus === 'failed' ? 'Timeline needs retry' : 'Ready for questions'}</span><button onClick={() => fileRef.current?.click()}><Plus size={14} />Replace</button></div></div>
+          <div className="studio-heading"><div><span className="overline">VIDEO UNDERSTANDING</span><h1>{fileName}</h1></div><div className="studio-meta"><span><i />{processing ? `Mapping moments · ${progress}%` : analysisStatus === 'failed' ? 'Timeline needs retry' : 'Ready for questions'}</span><button onClick={openUpload}><Plus size={14} />{previewMode ? 'Use your video' : 'Replace'}</button></div></div>
           <div className={`video-frame ${analysisStatus === 'failed' ? 'failed' : ''}`}>
             {videoUrl ? <video ref={videoRef} src={videoUrl} poster={sourceType === 'demo' ? '/demo/trail-runner.png' : undefined} controls onError={() => setPlaybackError(true)} onTimeUpdate={e => setCurrentTime(e.currentTarget.currentTime)} onLoadedMetadata={e => { setPlaybackError(false); setDuration(e.currentTarget.duration || 12); if (pendingSeekRef.current !== null) { e.currentTarget.currentTime = Math.min(pendingSeekRef.current, e.currentTarget.duration || pendingSeekRef.current); setCurrentTime(pendingSeekRef.current); pendingSeekRef.current = null; } }} /> : <button className="empty-player" onClick={() => fileRef.current?.click()}><UploadCloud size={26} /><strong>Choose a video</strong></button>}
             {playbackError && <div className="playback-error"><FileVideo2 size={22} /><strong>{sourceType === 'url' ? 'This web import needs repair' : 'This video codec cannot play in your browser'}</strong><p>{sourceType === 'url' ? 'The earlier download did not include a usable video track. Re-import it from the original link.' : 'MP4 (H.264) and WebM provide the best browser playback support.'}</p><button onClick={sourceType === 'url' ? repairRemoteImport : () => fileRef.current?.click()} disabled={repairingImport}>{sourceType === 'url' ? repairingImport ? 'Repairing…' : 'Repair web import' : 'Choose another file'}</button></div>}
@@ -1141,6 +1200,7 @@ function App() {
   const [email, setEmail] = useState('');
   const [message, setMessage] = useState('');
   const [sending, setSending] = useState(false);
+  const [previewingDemo, setPreviewingDemo] = useState(false);
 
   useEffect(() => {
     if (!supabase) {
@@ -1167,7 +1227,8 @@ function App() {
   }
 
   if (supabase && session === undefined) return <div className="auth-page"><Logo /><p>Opening your workspace…</p></div>;
-  if (supabase && !session) return <main className="auth-page"><Logo /><div className="auth-copy"><span>PRIVATE VIDEO WORKSPACE</span><h1>Sign in to your library.</h1><p>Your uploads, transcripts, notes, and conversations stay connected to your account.</p><form onSubmit={requestSignIn}><label htmlFor="sign-in-email">Email address</label><input id="sign-in-email" type="email" autoComplete="email" value={email} onChange={event => setEmail(event.target.value)} placeholder="you@example.com" required /><button type="submit" disabled={sending}>{sending ? 'Sending…' : 'Email me a sign-in link'} <ArrowRight size={14} /></button></form>{message && <p className="auth-message">{message}</p>}</div><div className="legal-links"><a href="/privacy.html">Privacy</a><a href="/terms.html">Terms</a></div></main>;
+  if (supabase && !session && previewingDemo) return <><WorkspaceApp previewMode onRequestSignIn={() => setPreviewingDemo(false)} /><button className="preview-signin" onClick={() => setPreviewingDemo(false)}>Sign in to use your videos <ArrowRight size={13} /></button></>;
+  if (supabase && !session) return <main className="auth-page"><Logo /><div className="auth-layout"><div className="auth-copy"><span>PRIVATE VIDEO WORKSPACE</span><h1>Understand a video before you sign in.</h1><p>Explore the complete 12-second demo, ask grounded questions, and jump between evidence-linked moments. Create an account only when you are ready to add your own videos.</p><button className="demo-entry" type="button" onClick={() => setPreviewingDemo(true)}><Play size={14} fill="currentColor" />Try the interactive demo</button><form onSubmit={requestSignIn}><label htmlFor="sign-in-email">Email address</label><input id="sign-in-email" type="email" autoComplete="email" value={email} onChange={event => setEmail(event.target.value)} placeholder="you@example.com" required /><button type="submit" disabled={sending}>{sending ? 'Sending…' : 'Email me a sign-in link'} <ArrowRight size={14} /></button></form>{message && <p className="auth-message">{message}</p>}</div><ol className="onboarding-steps"><li><span>01</span><strong>Open the demo</strong><p>See the real player, timeline, transcript, and question panel.</p></li><li><span>02</span><strong>Ask a question</strong><p>Try the suggested prompts and follow the answer back to its timestamp.</p></li><li><span>03</span><strong>Add your video</strong><p>Sign in when you want private uploads, public-link imports, and a saved library.</p></li></ol></div><div className="legal-links"><a href="/privacy.html">Privacy</a><a href="/terms.html">Terms</a></div></main>;
   return <><WorkspaceApp />{supabase && <button className="account-signout" onClick={() => supabase.auth.signOut()}>Sign out</button>}<div className="legal-links app-legal-links"><a href="/privacy.html">Privacy</a><a href="/terms.html">Terms</a></div></>;
 }
 
