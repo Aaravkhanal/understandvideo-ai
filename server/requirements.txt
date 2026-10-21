@@ -6,7 +6,7 @@ openai>=1.70,<3
 opencv-python-headless>=4.10,<5
 yt-dlp>=2026.1,<2027
 imageio-ffmpeg>=0.6,<1
-faster-whisper>=1.2,<2
+faster-whisper>=1.2.1,<2
 pyannote.audio>=4,<5
 # faster-whisper 1.2 still calls a PyAV option removed in newer releases.
 av>=14,<17
