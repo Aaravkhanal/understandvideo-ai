@@ -9,6 +9,6 @@ imageio-ffmpeg>=0.6,<1
 faster-whisper>=1.2,<2
 pyannote.audio>=4,<5
 # faster-whisper 1.2 still calls a PyAV option removed in newer releases.
-av>=14,<17
+av>=19.0.1,<20
 redis>=5,<7
 psycopg[binary]>=3.2,<4
