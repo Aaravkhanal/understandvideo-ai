@@ -117,6 +117,8 @@ available instead of inventing an answer.
 The prioritized work is tracked in the
 [implementation plan](docs/IMPLEMENTATION_PLAN.md) and
 [product roadmap](docs/PLATFORM_ROADMAP.md).
+The staging and public-launch procedure is in the
+[production runbook](docs/PRODUCTION_RUNBOOK.md).
 
 ---
 

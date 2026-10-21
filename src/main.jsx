@@ -1167,8 +1167,8 @@ function App() {
   }
 
   if (supabase && session === undefined) return <div className="auth-page"><Logo /><p>Opening your workspace…</p></div>;
-  if (supabase && !session) return <main className="auth-page"><Logo /><div className="auth-copy"><span>PRIVATE VIDEO WORKSPACE</span><h1>Sign in to your library.</h1><p>Your uploads, transcripts, notes, and conversations stay connected to your account.</p><form onSubmit={requestSignIn}><label htmlFor="sign-in-email">Email address</label><input id="sign-in-email" type="email" autoComplete="email" value={email} onChange={event => setEmail(event.target.value)} placeholder="you@example.com" required /><button type="submit" disabled={sending}>{sending ? 'Sending…' : 'Email me a sign-in link'} <ArrowRight size={14} /></button></form>{message && <p className="auth-message">{message}</p>}</div></main>;
-  return <><WorkspaceApp />{supabase && <button className="account-signout" onClick={() => supabase.auth.signOut()}>Sign out</button>}</>;
+  if (supabase && !session) return <main className="auth-page"><Logo /><div className="auth-copy"><span>PRIVATE VIDEO WORKSPACE</span><h1>Sign in to your library.</h1><p>Your uploads, transcripts, notes, and conversations stay connected to your account.</p><form onSubmit={requestSignIn}><label htmlFor="sign-in-email">Email address</label><input id="sign-in-email" type="email" autoComplete="email" value={email} onChange={event => setEmail(event.target.value)} placeholder="you@example.com" required /><button type="submit" disabled={sending}>{sending ? 'Sending…' : 'Email me a sign-in link'} <ArrowRight size={14} /></button></form>{message && <p className="auth-message">{message}</p>}</div><div className="legal-links"><a href="/privacy.html">Privacy</a><a href="/terms.html">Terms</a></div></main>;
+  return <><WorkspaceApp />{supabase && <button className="account-signout" onClick={() => supabase.auth.signOut()}>Sign out</button>}<div className="legal-links app-legal-links"><a href="/privacy.html">Privacy</a><a href="/terms.html">Terms</a></div></>;
 }
 
 const rootElement = document.getElementById('root');

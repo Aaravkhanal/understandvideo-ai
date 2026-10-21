@@ -35,6 +35,15 @@ def main() -> None:
         require("SUPABASE_SERVICE_ROLE_KEY")
     require("OIDC_ISSUER_URL")
     require("OIDC_AUDIENCE")
+    public_url = urlparse(require("APP_PUBLIC_URL"))
+    if public_url.scheme != "https" or not public_url.netloc or public_url.hostname in {"localhost", "127.0.0.1"}:
+        raise SystemExit("APP_PUBLIC_URL must be a public HTTPS address")
+    supabase_url = require("VITE_SUPABASE_URL")
+    if urlparse(supabase_url).scheme != "https":
+        raise SystemExit("VITE_SUPABASE_URL must use HTTPS")
+    publishable_key = require("VITE_SUPABASE_PUBLISHABLE_KEY")
+    if publishable_key.startswith("replace-"):
+        raise SystemExit("VITE_SUPABASE_PUBLISHABLE_KEY must be configured")
     if os.getenv("AUTH_MODE") != "required":
         raise SystemExit("AUTH_MODE must be required in production")
     print("Production security configuration is valid")

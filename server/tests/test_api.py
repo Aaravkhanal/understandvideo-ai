@@ -63,6 +63,9 @@ class ApiTestCase(unittest.TestCase):
         return response.json()["id"]
 
     def test_public_config_matches_runtime_limits(self) -> None:
+        readiness = self.client.get("/api/ready")
+        self.assertEqual(readiness.status_code, 200, readiness.text)
+        self.assertEqual(readiness.json()["status"], "ready")
         response = self.client.get("/api/config")
         self.assertEqual(response.status_code, 200)
         payload = response.json()

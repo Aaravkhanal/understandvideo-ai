@@ -16,7 +16,8 @@
     "test:web": "node --test src/*.test.js",
     "check:python": "scripts/python.sh -m compileall -q server scripts video_chatgpt data quantitative_evaluation",
     "check": "npm run build && npm run test:web && npm run check:python && npm run test:api",
-    "test:e2e": "playwright test"
+    "test:e2e": "playwright test",
+    "test:load": "scripts/python.sh scripts/load_test.py"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.118.0",

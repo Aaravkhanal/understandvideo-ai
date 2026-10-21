@@ -26,6 +26,7 @@ jobs:
           DEFAULT_RETENTION_DAYS: '90'
           MAX_UPLOAD_BYTES: '104857600'
           CORS_ORIGINS: https://video.example.com
+          APP_PUBLIC_URL: https://video.example.com
           VIDEO_WORKER_TOKEN: ci-only-token-0123456789abcdef0123456789
           DATABASE_URL: postgresql://ci-placeholder
           REDIS_URL: redis://ci-placeholder
@@ -36,6 +37,8 @@ jobs:
           OIDC_ISSUER_URL: https://example.supabase.co/auth/v1
           OIDC_AUDIENCE: authenticated
           AUTH_MODE: required
+          VITE_SUPABASE_URL: https://example.supabase.co
+          VITE_SUPABASE_PUBLISHABLE_KEY: sb_publishable_ci-placeholder
         run: |
           npm run validate:production
           docker compose -f compose.production.yml config --quiet

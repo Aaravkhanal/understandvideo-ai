@@ -1,4 +1,80 @@
 services:
+  web:
+    build:
+      context: .
+      dockerfile: docker/web.Dockerfile
+      args:
+        VITE_SUPABASE_URL: ${VITE_SUPABASE_URL:?Set VITE_SUPABASE_URL}
+        VITE_SUPABASE_PUBLISHABLE_KEY: ${VITE_SUPABASE_PUBLISHABLE_KEY:?Set VITE_SUPABASE_PUBLISHABLE_KEY}
+    restart: unless-stopped
+    ports:
+      - "${APP_PORT:-8080}:8080"
+    depends_on:
+      api:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx:size=32m,noexec,nosuid,nodev
+      - /var/run:size=8m,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    networks:
+      - public-edge
+      - private-services
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    restart: unless-stopped
+    env_file:
+      - path: .env.production
+        required: false
+    environment:
+      MALWARE_SCAN_MODE: required
+      RUN_BACKGROUND_JOBS: "false"
+      UPLOAD_ROOT: /app/server/uploads
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      storage-init:
+        condition: service_completed_successfully
+      clamav:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - media:/app/server/uploads
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    cpus: 2.0
+    mem_limit: 2g
+    memswap_limit: 2g
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8787/api/ready"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 30s
+    networks:
+      - private-services
+
   storage-init:
     image: node:22-bookworm-slim
     command: ["chown", "-R", "1000:1000", "/app/server/uploads", "/app/server/runtime"]
@@ -67,6 +143,7 @@ services:
         required: false
     environment:
       MALWARE_SCAN_MODE: required
+      RUN_BACKGROUND_JOBS: "true"
       UPLOAD_ROOT: /app/server/uploads
       DATABASE_PATH: /app/server/runtime/understandvideo.db
       REDIS_URL: redis://redis:6379/0
@@ -102,12 +179,41 @@ services:
     networks:
       - private-services
 
+  backup:
+    image: postgres:17-alpine
+    profiles: ["maintenance"]
+    env_file:
+      - path: .env.production
+        required: false
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        umask 077
+        stamp=$$(date -u +%Y%m%dT%H%M%SZ)
+        pg_dump "$$DATABASE_URL" --no-owner --no-privileges | gzip > "/backups/understandvideo-$$stamp.sql.gz"
+        find /backups -type f -name 'understandvideo-*.sql.gz' -mtime +"$${BACKUP_RETENTION_DAYS:-30}" -delete
+        gzip -t "/backups/understandvideo-$$stamp.sql.gz"
+    volumes:
+      - database-backups:/backups
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - private-services
+
 volumes:
   clamav-signatures:
   media:
   metadata:
   redis-data:
+  database-backups:
 
 networks:
+  public-edge:
   private-services:
     internal: false

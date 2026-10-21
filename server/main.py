@@ -30,7 +30,7 @@ from server.analysis import AnalysisError, extract_scene_thumbnails
 from server.auth import Identity, auth_mode, verify_bearer_token
 from server.database import connect, using_postgres
 from server.inference import answer_video_question, inference_mode, is_demo_video
-from server.job_queue import notify_jobs
+from server.job_queue import notify_jobs, redis_client
 from server.remote_import import RemoteImportCancelled, RemoteImportError, import_remote_video, platform_hosts, validate_public_https_url
 from server.storage import LocalStorage, StorageError, SupabaseStorage
 from server.transcription import NoAudioTrack, TranscriptionError, TranscriptionUnavailable, transcribe_video
@@ -699,7 +699,7 @@ def require_workspace_role(*allowed_roles: str) -> str:
 async def authenticate_request(request: Request, call_next):
     public_path = (
         request.method == "OPTIONS"
-        or request.url.path in {"/api/health", "/api/config"}
+        or request.url.path in {"/api/health", "/api/ready", "/api/config"}
         or request.url.path.startswith("/api/shares/")
     )
     identity = None
@@ -728,6 +728,8 @@ async def authenticate_request(request: Request, call_next):
 @app.on_event("startup")
 async def on_startup() -> None:
     initialize()
+    if os.getenv("RUN_BACKGROUND_JOBS", "true").strip().lower() in {"0", "false", "off"}:
+        return
     purge_expired_videos()
     import_task = asyncio.create_task(asyncio.to_thread(run_pending_import_jobs))
     startup_tasks.add(import_task)
@@ -753,6 +755,14 @@ async def observe_requests(request: Request, call_next):
     request_metrics[f"status_{response.status_code // 100}xx"] += 1
     response.headers["X-Request-ID"] = request_id
     response.headers["Server-Timing"] = f"app;dur={elapsed:.1f}"
+    logger.info(
+        "request_complete request_id=%s method=%s path=%s status=%s duration_ms=%.1f",
+        request_id,
+        request.method,
+        request.url.path,
+        response.status_code,
+        elapsed,
+    )
     return response
 
 
@@ -1322,6 +1332,22 @@ def health() -> dict[str, str]:
         "mode": inference_mode(),
         "database": "postgresql" if using_postgres() else "sqlite",
     }
+
+
+@app.get("/api/ready")
+def readiness() -> dict[str, str]:
+    try:
+        with db() as connection:
+            connection.execute("SELECT 1").fetchone()
+        storage().ensure_ready()
+        if os.getenv("REDIS_URL", "").strip() and redis_client() is None:
+            redis_client.cache_clear()
+            if redis_client() is None:
+                raise RuntimeError("Redis is unavailable")
+    except Exception as exc:
+        logger.exception("Readiness check failed")
+        raise HTTPException(status_code=503, detail="A required service is unavailable") from exc
+    return {"status": "ready", "database": "postgresql" if using_postgres() else "sqlite"}
 
 
 @app.get("/api/metrics")

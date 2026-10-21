@@ -445,6 +445,10 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 .auth-copy button:disabled { opacity: .35; cursor: wait; }
 .auth-message { margin-top: 20px; color: var(--ink) !important; }
 .account-signout { position: fixed; z-index: 50; left: 28px; bottom: 25px; }
+.legal-links { display: flex; gap: 16px; font-size: 8px; }
+.legal-links a { color: var(--ink); text-underline-offset: 3px; }
+.auth-page > .legal-links { margin-top: auto; }
+.app-legal-links { position: fixed; z-index: 40; right: 28px; bottom: 25px; }
 
 @media (max-width: 680px) {
   .auth-copy form { grid-template-columns: 1fr; }
