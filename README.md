@@ -120,6 +120,10 @@ The prioritized work is tracked in the
 The staging and public-launch procedure is in the
 [production runbook](docs/PRODUCTION_RUNBOOK.md).
 The root [Render blueprint](render.yaml) provides a no-card staging deployment.
+The current staging build is available at
+[understandvideo-ai.onrender.com](https://understandvideo-ai.onrender.com). Its
+application and PostgreSQL readiness checks, plus a 50-request concurrency test,
+were verified successfully on October 21, 2026.
 It intentionally keeps malware scanning best-effort and uses a small local
 speech model because Render's free instance has limited memory. Use the Docker
 Compose production stack for a public production launch.
