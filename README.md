@@ -92,8 +92,9 @@ available instead of inventing an answer.
 - Pluggable demo, cloud-vision, and HTTP worker inference adapters, plus a
   separately runnable grounded-answer worker with storage-root and token checks.
 - Timestamped workspace notes, Markdown/JSON/premium HTML report exports,
-  expiring exact-moment links, downloadable 30-second clips, local review states,
-  assignments/comments, and side-by-side structural video comparison.
+  exact-moment links with selectable expiry, clips with user-selected start and
+  end points, local review states, assignments/comments, side-by-side structural
+  comparison, and optional provider-backed semantic comparison.
 - A workspace control screen for switching shared workspaces, creating and
   tracking invitations, issuing and revoking API keys, configuring signed
   webhooks, and reviewing or retrying background imports and analysis jobs.
@@ -432,6 +433,7 @@ the API and worker on a private network with the same durable processing volume.
 | `POST` | `/api/videos/{id}/shares` | Create an expiring exact-moment share link. |
 | `GET` | `/api/shares/{token}` | Open public metadata for an unexpired shared moment. |
 | `POST` | `/api/compare` | Compare two workspace videos and pair saved timeline moments. |
+| `POST` | `/api/compare/semantic` | Compare sampled frames and transcripts when a vision provider is configured. |
 | `GET/POST` | `/api/developer/api-keys` | List metadata or create a key shown only once. |
 | `DELETE` | `/api/developer/api-keys/{id}` | Revoke an API key. |
 | `GET/POST` | `/api/developer/webhooks` | List or register signed HTTPS webhooks. |

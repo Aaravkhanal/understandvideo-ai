@@ -151,11 +151,13 @@ Acceptance criteria:
 
 ## Phase 5 — Differentiating product features
 
-- Structural video comparison with paired timeline moments is shipped; grounded
-  semantic change explanations remain.
+- Structural comparison with paired timeline moments and optional on-demand
+  semantic comparison grounded in sampled frames and transcripts is shipped;
+  it requires a configured local Ollama or cloud vision provider.
 - Speaker labels, transcript navigation, quote highlights, and search are
   shipped; transcript correction and SRT/VTT exports are now exposed in the UI.
-- Expiring exact-moment share links are shipped; multi-moment collections,
+- Exact-moment share links with selectable expiry (1 hour to 30 days) are
+  shipped; multi-moment collections,
   password protection, revocation, and view analytics remain.
 - Markdown, JSON, and styled HTML exports with support, research, review, and
   content-brief templates are shipped; native PDF output remains.
@@ -194,12 +196,11 @@ assignees, and timestamped review comments.
 
 Still requiring implementation or deployment work:
 
-- Semantic comparison grounded in frames from both videos. Current comparison
-  is structural and can report transcript term overlap.
 - Semantic search and model-generated chapter titles. Search currently matches
   stored text and chapter titles are deterministic.
-- Multi-moment share collections, password protection, revocation, view
-  analytics, and selectable clip trimming. Current shares target one moment.
+- Multi-moment share collections, password protection, revocation, and view
+  analytics. Shares currently target one moment; clip downloads support a
+  user-selected start and end up to 120 seconds.
 - PDF report generation and workspace branding. Browser printing is available
   for the current HTML report.
 - The hardened Compose stack, managed PostgreSQL/Redis, and durable shared

@@ -30,7 +30,7 @@ from pydantic import BaseModel, Field, HttpUrl, field_validator
 from server.analysis import AnalysisError, extract_scene_thumbnails
 from server.auth import Identity, auth_mode, verify_bearer_token
 from server.database import connect, using_postgres
-from server.inference import answer_video_question, inference_mode, is_demo_video
+from server.inference import answer_video_question, compare_video_evidence, inference_mode, is_demo_video
 from server.job_queue import notify_jobs, redis_client
 from server.remote_import import RemoteImportCancelled, RemoteImportError, import_remote_video, platform_hosts, remote_source_details, validate_public_https_url
 from server.storage import LocalStorage, StorageError, SupabaseStorage
@@ -2769,6 +2769,25 @@ def compare_videos(payload: CompareVideosRequest) -> dict:
         "shared_terms": shared_terms,
         "semantic_status": semantic_status,
     }
+
+
+@app.post("/api/compare/semantic")
+def compare_videos_semantically(payload: CompareVideosRequest) -> dict:
+    first, second = [dict(video_record(video_id)) for video_id in payload.video_ids]
+    with db() as connection:
+        for item in (first, second):
+            item["transcript"] = [dict(row) for row in connection.execute(
+                "SELECT start_seconds, text FROM transcript_segments WHERE video_id = ? ORDER BY position LIMIT 35",
+                (item["id"],),
+            ).fetchall()]
+    try:
+        result = compare_video_evidence(first, second)
+    except Exception as exc:
+        logger.exception("Semantic comparison failed for videos %s and %s", first["id"], second["id"])
+        raise HTTPException(status_code=503, detail="The configured vision model could not compare these videos. Check model availability and try again.") from exc
+    if not result:
+        raise HTTPException(status_code=503, detail="Connect a local Ollama vision model or cloud vision provider to generate a semantic comparison.")
+    return {"comparison": result, "provider": inference_mode()}
 
 
 @app.get("/api/videos/{video_id}/summary")

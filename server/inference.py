@@ -82,6 +82,63 @@ def sample_video_frames(path: Path, count: int = 8, max_dimension: int = 960) ->
         capture.release()
 
 
+def compare_video_evidence(first: dict, second: dict) -> str | None:
+    """Compare two videos only when an operator has configured a vision model."""
+    if os.getenv("VIDEO_WORKER_URL"):
+        return None
+    first_frames = sample_video_frames(Path(first["path"]), count=3, max_dimension=448)
+    second_frames = sample_video_frames(Path(second["path"]), count=3, max_dimension=448)
+    if not first_frames or not second_frames:
+        raise RuntimeError("Could not extract comparison frames from both videos")
+
+    first_transcript = "\n".join(
+        f"{float(item['start_seconds']):.1f}s: {item['text']}" for item in first.get("transcript", [])[:35]
+    )
+    second_transcript = "\n".join(
+        f"{float(item['start_seconds']):.1f}s: {item['text']}" for item in second.get("transcript", [])[:35]
+    )
+    frame_map = []
+    images = []
+    for label, frames in (("A", first_frames), ("B", second_frames)):
+        for seconds, encoded in frames:
+            frame_map.append(f"Video {label}, {seconds:.1f} seconds")
+            images.append(encoded)
+    prompt = (
+        "Compare the two supplied videos using only these sampled frames and transcripts. "
+        "Explain the important visual, action, setting, and spoken-content differences and any similarities. "
+        "Do not assume unseen events. Give concise findings and cite evidence as Video A at MM:SS or Video B at MM:SS. "
+        "Say when the samples do not support a conclusion.\n\n"
+        f"Video A: {first['name']} ({float(first.get('duration') or 0):.1f}s). Frames: {', '.join(frame_map[:len(first_frames)])}.\n"
+        f"Transcript A:\n{first_transcript or '(not available)'}\n\n"
+        f"Video B: {second['name']} ({float(second.get('duration') or 0):.1f}s). Frames: {', '.join(frame_map[len(first_frames):])}.\n"
+        f"Transcript B:\n{second_transcript or '(not available)'}"
+    )
+    if os.getenv("OLLAMA_VISION_MODEL"):
+        body = json.dumps({
+            "model": os.getenv("OLLAMA_VISION_MODEL", "qwen3-vl:2b-instruct"),
+            "stream": False,
+            "think": False,
+            "messages": [{"role": "user", "content": prompt, "images": images}],
+            "options": {"temperature": 0.1, "num_predict": 320},
+        }).encode("utf-8")
+        endpoint = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/") + "/api/chat"
+        request = urllib.request.Request(endpoint, data=body, method="POST", headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(request, timeout=float(os.getenv("OLLAMA_REQUEST_TIMEOUT", "300"))) as response:
+            result = json.loads(response.read().decode("utf-8"))
+        return str(result.get("message", {}).get("content", "")).strip() or None
+    if os.getenv("OPENAI_API_KEY"):
+        from openai import OpenAI
+
+        content = [{"type": "input_text", "text": prompt}]
+        content.extend({"type": "input_image", "image_url": f"data:image/jpeg;base64,{image}", "detail": "low"} for image in images)
+        response = OpenAI(timeout=float(os.getenv("OPENAI_REQUEST_TIMEOUT", "60"))).responses.create(
+            model=os.getenv("OPENAI_VISION_MODEL", "gpt-4.1-mini"),
+            input=[{"role": "user", "content": content}],
+        )
+        return response.output_text.strip() or None
+    return None
+
+
 @dataclass(frozen=True)
 class InferenceRequest:
     path: Path

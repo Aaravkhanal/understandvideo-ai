@@ -100,9 +100,10 @@ video is ready, with no lost jobs during worker restarts.
 
 - Full-library text search, tags, transcript speakers, chapters, quote
   highlights, per-line transcript/speaker correction, and SRT/VTT downloads.
-- Structural two-video comparison; semantic comparison grounded in evidence
-  from both videos remains.
-- Timestamped notes, exact-moment share links, bounded clip downloads, team
+- Structural two-video comparison and optional on-demand semantic comparison
+  grounded in sampled frames and available transcripts when a vision provider is configured.
+- Timestamped notes, exact-moment share links with selectable expiry, selectable
+  clip start/end points (up to 120 seconds), team
   assignments, review states, and comments.
 - Markdown, JSON, and styled HTML report templates for research, review,
   support-ticket, and content-brief use; native PDF output remains.
