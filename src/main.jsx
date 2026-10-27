@@ -4,9 +4,9 @@ import { createClient } from '@supabase/supabase-js';
 import {
   ArrowRight, ArrowUp, Check, ChevronRight,
   Clock3, Download, FileVideo2, Grid2X2,
-  Home, Image as ImageIcon, Layers3, Library,
+  Home, Image as ImageIcon, KeyRound, Layers3, Library,
   Link2, MessageSquareText, PanelLeftClose, Play, Plus,
-  Search, Sparkles, UploadCloud, Video
+  Search, Settings2, Sparkles, UploadCloud, Users, Video, Webhook
 } from 'lucide-react';
 import './styles.css';
 import { formatTime, timestampPattern, timestampToSeconds } from './video-utils.js';
@@ -51,6 +51,8 @@ function importMetrics(job) {
 
 async function apiFetch(input, init = {}) {
   const headers = new Headers(init.headers || {});
+  const selectedWorkspace = window.localStorage.getItem('understandvideo.workspace');
+  if (selectedWorkspace) headers.set('X-Workspace-ID', selectedWorkspace);
   if (supabase) {
     const { data } = await supabase.auth.getSession();
     if (data.session?.access_token) headers.set('Authorization', `Bearer ${data.session.access_token}`);
@@ -159,6 +161,8 @@ function WorkspaceApp({ previewMode = false, onRequestSignIn = () => {} }) {
   const [transcriptChapters, setTranscriptChapters] = useState([]);
   const [transcriptQuery, setTranscriptQuery] = useState('');
   const [transcriptLoading, setTranscriptLoading] = useState(false);
+  const [editingSegmentId, setEditingSegmentId] = useState('');
+  const [segmentDraft, setSegmentDraft] = useState({ text: '', speaker: '' });
   const [annotations, setAnnotations] = useState([]);
   const [annotationDraft, setAnnotationDraft] = useState('');
   const [videoTags, setVideoTags] = useState([]);
@@ -184,6 +188,26 @@ function WorkspaceApp({ previewMode = false, onRequestSignIn = () => {} }) {
   const [pendingDeleteId, setPendingDeleteId] = useState('');
   const [compareSelection, setCompareSelection] = useState([]);
   const [comparison, setComparison] = useState(null);
+  const [settingsTab, setSettingsTab] = useState('workspace');
+  const [workspaceInfo, setWorkspaceInfo] = useState(null);
+  const [availableWorkspaces, setAvailableWorkspaces] = useState([]);
+  const [queueJobs, setQueueJobs] = useState([]);
+  const [invitations, setInvitations] = useState([]);
+  const [apiKeys, setApiKeys] = useState([]);
+  const [webhooks, setWebhooks] = useState([]);
+  const [settingsEmail, setSettingsEmail] = useState('');
+  const [invitationToken, setInvitationToken] = useState('');
+  const [settingsRole, setSettingsRole] = useState('viewer');
+  const [settingsKeyName, setSettingsKeyName] = useState('');
+  const [settingsWebhookUrl, setSettingsWebhookUrl] = useState('');
+  const [settingsWebhookEvents, setSettingsWebhookEvents] = useState(['video.ready']);
+  const [oneTimeSecret, setOneTimeSecret] = useState('');
+  const [settingsBusy, setSettingsBusy] = useState(false);
+  const [settingsError, setSettingsError] = useState('');
+  const [review, setReview] = useState({ state: 'draft', assignee: '' });
+  const [reviewComments, setReviewComments] = useState([]);
+  const [reviewCommentDraft, setReviewCommentDraft] = useState('');
+  const [retentionDays, setRetentionDays] = useState('');
   const [toast, setToast] = useState('');
   const videoRef = useRef(null);
   const fileRef = useRef(null);
@@ -338,6 +362,138 @@ function WorkspaceApp({ previewMode = false, onRequestSignIn = () => {} }) {
     } catch {
       // Keep the last usable library snapshot while the API reconnects.
     }
+  }
+
+  async function loadSettings() {
+    setSettingsError('');
+    const load = async (path, fallback) => {
+      const response = await apiFetch(`${API_BASE}${path}`);
+      if (!response.ok) throw new Error((await response.json().catch(() => ({}))).detail || 'Settings could not be loaded');
+      return response.json();
+    };
+    try {
+      const [workspace, workspaces, invitationRows, keyRows, webhookRows, imports, jobs] = await Promise.all([
+        load('/api/workspace', null), load('/api/workspaces', []), load('/api/workspace/invitations', []).catch(() => []),
+        load('/api/developer/api-keys', []).catch(() => []), load('/api/developer/webhooks', []).catch(() => []), load('/api/imports', []), load('/api/jobs', [])
+      ]);
+      setWorkspaceInfo(workspace);
+      setAvailableWorkspaces(workspaces);
+      setInvitations(invitationRows);
+      setApiKeys(keyRows);
+      setWebhooks(webhookRows);
+      setQueueJobs(jobs);
+      setImportJob(imports.find(job => ['queued', 'processing', 'failed'].includes(job.status)) || null);
+    } catch (error) {
+      setSettingsError(error.message || 'Settings could not be loaded');
+    }
+  }
+
+  useEffect(() => { if (page === 'settings' && !previewMode) void loadSettings(); }, [page, previewMode]);
+
+  async function settingsRequest(path, options = {}) {
+    const response = await apiFetch(`${API_BASE}${path}`, options);
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({}));
+      throw new Error(body.detail || `Request failed (${response.status})`);
+    }
+    return response.status === 204 ? null : response.json();
+  }
+
+  async function createInvitation(event) {
+    event.preventDefault(); setSettingsBusy(true); setSettingsError('');
+    try {
+      const result = await settingsRequest('/api/workspace/invitations', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: settingsEmail, role: settingsRole }) });
+      setOneTimeSecret(`Invitation for ${result.email}: ${result.token}`); setSettingsEmail(''); await loadSettings();
+    } catch (error) { setSettingsError(error.message); } finally { setSettingsBusy(false); }
+  }
+
+  async function acceptInvitation(event) {
+    event.preventDefault(); setSettingsBusy(true); setSettingsError('');
+    try {
+      const result = await settingsRequest('/api/workspace/invitations/accept', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: invitationToken.trim() }) });
+      window.localStorage.setItem('understandvideo.workspace', result.workspace_id);
+      window.location.reload();
+    } catch (error) { setSettingsError(error.message); } finally { setSettingsBusy(false); }
+  }
+
+  async function createApiKey(event) {
+    event.preventDefault(); setSettingsBusy(true); setSettingsError('');
+    try {
+      const result = await settingsRequest('/api/developer/api-keys', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: settingsKeyName }) });
+      setOneTimeSecret(`API key (${result.name}) — copy it now: ${result.key}`); setSettingsKeyName(''); await loadSettings();
+    } catch (error) { setSettingsError(error.message); } finally { setSettingsBusy(false); }
+  }
+
+  async function revokeApiKey(key) {
+    if (!window.confirm(`Revoke “${key.name}”? Applications using it will stop working.`)) return;
+    try { await settingsRequest(`/api/developer/api-keys/${key.id}`, { method: 'DELETE' }); await loadSettings(); }
+    catch (error) { setSettingsError(error.message); }
+  }
+
+  async function createWebhook(event) {
+    event.preventDefault(); setSettingsBusy(true); setSettingsError('');
+    try {
+      const result = await settingsRequest('/api/developer/webhooks', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: settingsWebhookUrl, events: settingsWebhookEvents }) });
+      setOneTimeSecret(`Webhook signing secret — copy it now: ${result.signing_secret}`); setSettingsWebhookUrl(''); await loadSettings();
+    } catch (error) { setSettingsError(error.message); } finally { setSettingsBusy(false); }
+  }
+
+  async function sendWebhookTest(hook) {
+    try { const result = await settingsRequest(`/api/developer/webhooks/${hook.id}/test`, { method: 'POST' }); setToast(result.delivered ? 'Test event delivered' : 'Webhook did not accept the test'); }
+    catch (error) { setSettingsError(error.message); }
+  }
+
+  async function removeWebhook(hook) {
+    try { await settingsRequest(`/api/developer/webhooks/${hook.id}`, { method: 'DELETE' }); await loadSettings(); }
+    catch (error) { setSettingsError(error.message); }
+  }
+
+  async function loadReview(video) {
+    if (!video?.id) return;
+    try {
+      const [reviewResult, commentsResult] = await Promise.all([
+        apiFetch(`${API_BASE}/api/videos/${video.id}/review`).then(response => response.json()),
+        apiFetch(`${API_BASE}/api/videos/${video.id}/comments`).then(response => response.json())
+      ]);
+      if (activeVideoIdRef.current === video.id) {
+        setReview(reviewResult); setReviewComments(commentsResult);
+        setRetentionDays(video.expires_at ? String(Math.max(1, Math.ceil((video.expires_at - Date.now() / 1000) / 86400))) : '');
+      }
+    } catch { /* Review tools remain optional if the API is reconnecting. */ }
+  }
+
+  async function updateReview(patch) {
+    if (!videoId) return;
+    const next = { ...review, ...patch };
+    try {
+      const response = await apiFetch(`${API_BASE}/api/videos/${videoId}/review`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(next) });
+      if (!response.ok) throw new Error(); setReview(await response.json()); setToast('Review updated');
+    } catch { setToast('Review could not be updated'); }
+  }
+
+  async function addReviewComment(event) {
+    event.preventDefault(); if (!videoId || !reviewCommentDraft.trim()) return;
+    try {
+      const response = await apiFetch(`${API_BASE}/api/videos/${videoId}/comments`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ body: reviewCommentDraft, timestamp: currentTime }) });
+      if (!response.ok) throw new Error(); const savedComment = await response.json(); setReviewComments(items => [...items, savedComment]); setReviewCommentDraft('');
+    } catch { setToast('Comment could not be saved'); }
+  }
+
+  async function saveRetention(event) {
+    event.preventDefault(); if (!videoId) return;
+    try {
+      const days = retentionDays.trim() ? Number(retentionDays) : null;
+      const response = await apiFetch(`${API_BASE}/api/videos/${videoId}/retention`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ days }) });
+      if (!response.ok) throw new Error(); setToast(days ? `Video will be deleted after ${days} days` : 'Automatic deletion turned off');
+    } catch { setToast('Retention setting could not be saved'); }
+  }
+
+  async function saveTranscriptSegment(segment) {
+    try {
+      const response = await apiFetch(`${API_BASE}/api/videos/${videoId}/transcript/segments/${segment.id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(segmentDraft) });
+      if (!response.ok) throw new Error(); const updated = await response.json();
+      setTranscriptSegments(items => items.map(item => item.id === updated.id ? { ...item, ...updated } : item)); setEditingSegmentId('');
+    } catch { setToast('Transcript line could not be saved'); }
   }
 
   async function selectConversation(conversation) {
@@ -753,6 +909,9 @@ function WorkspaceApp({ previewMode = false, onRequestSignIn = () => {} }) {
     setAnnotations([]);
     setAnnotationDraft('');
     setVideoTags(video.tags || []);
+    setReview({ state: 'draft', assignee: '' });
+    setReviewComments([]);
+    void loadReview(video);
     setTagDraft('');
     setLastShareUrl('');
     setAnalysisStatus(video.analysis_status || 'queued');
@@ -1076,6 +1235,7 @@ function WorkspaceApp({ previewMode = false, onRequestSignIn = () => {} }) {
         <button className={page === 'home' ? 'active' : ''} onClick={() => setPage('home')}><Home size={17} /><span>Home</span></button>
         <button className={page === 'studio' ? 'active' : ''} onClick={() => videoUrl ? setPage('studio') : fileRef.current?.click()}><MessageSquareText size={17} /><span>Video chat</span><kbd>⌘K</kbd></button>
         <button className={page === 'library' ? 'active' : ''} onClick={openLibrary}><Library size={17} /><span>Library</span></button>
+        {!previewMode && <button className={page === 'settings' ? 'active' : ''} onClick={() => setPage('settings')}><Settings2 size={17} /><span>Workspace</span></button>}
       </nav>
       <div className="rail-spacer" />
       <span className="maker-note">Made by Aarav</span>
@@ -1151,6 +1311,37 @@ function WorkspaceApp({ previewMode = false, onRequestSignIn = () => {} }) {
         </div>
       </main>}
 
+      {page === 'settings' && <main className="settings-page">
+        <div className="page-heading"><div><span className="overline">WORKSPACE</span><h1>{workspaceInfo?.name || 'Your workspace'}</h1><p>Manage access, integrations, and background work.</p></div></div>
+        {availableWorkspaces.length > 1 && <label className="workspace-picker">Switch workspace<select value={workspaceInfo?.id || ''} onChange={event => { window.localStorage.setItem('understandvideo.workspace', event.target.value); window.location.reload(); }}>{availableWorkspaces.map(workspace => <option key={workspace.id} value={workspace.id}>{workspace.name} · {workspace.role}</option>)}</select></label>}
+        <nav className="settings-tabs" aria-label="Workspace settings">
+          {[['workspace', 'Team'], ['developer', 'Developer'], ['activity', 'Processing']].map(([key, label]) => <button key={key} className={settingsTab === key ? 'active' : ''} onClick={() => setSettingsTab(key)}>{label}</button>)}
+        </nav>
+        {settingsError && <p className="settings-error" role="status">{settingsError}</p>}
+        {oneTimeSecret && <div className="one-time-secret"><strong>Shown once. Copy and store this securely.</strong><code>{oneTimeSecret}</code><button onClick={() => { navigator.clipboard?.writeText(oneTimeSecret); setOneTimeSecret(''); setToast('Copied to clipboard'); }}>Copy and dismiss</button><button onClick={() => setOneTimeSecret('')}>Dismiss</button></div>}
+        {settingsTab === 'workspace' && <section className="settings-section">
+          <div className="settings-section-heading"><div><h2>Invite a teammate</h2><p>Invitation links expire after seven days. Share the token with the invited person.</p></div><span>{workspaceInfo?.video_count ?? 0} videos</span></div>
+          {workspaceInfo?.role === 'owner' && <form className="settings-form" onSubmit={createInvitation}><label>Email<input type="email" required value={settingsEmail} onChange={event => setSettingsEmail(event.target.value)} placeholder="teammate@example.com" /></label><label>Access<select value={settingsRole} onChange={event => setSettingsRole(event.target.value)}><option value="viewer">Viewer</option><option value="editor">Editor</option></select></label><button disabled={settingsBusy}>Create invitation</button></form>}
+          <div className="settings-list">{invitations.map(invite => <div key={invite.id}><span><strong>{invite.email}</strong><small>{invite.role} · {invite.accepted_at ? 'Accepted' : `Expires ${new Date(invite.expires_at * 1000).toLocaleDateString()}`}</small></span><span>{invite.accepted_at ? 'Joined' : 'Pending'}</span></div>)}{!invitations.length && <p>{workspaceInfo?.role === 'owner' ? 'No invitations yet.' : 'Only workspace owners can manage invitations.'}</p>}</div>
+          <div className="workspace-facts"><span>Storage <strong>Private Supabase bucket</strong></span><span>Database <strong>{workspaceInfo?.mode === 'supabase' ? 'PostgreSQL' : workspaceInfo?.mode || 'Checking'}</strong></span><span>Your role <strong>{workspaceInfo?.role || '—'}</strong></span></div>
+          <div className="settings-section-heading webhook-heading"><div><h2>Join a workspace</h2><p>Paste a seven-day invitation token shared with your signed-in email.</p></div><Users size={18} /></div>
+          <form className="settings-form single" onSubmit={acceptInvitation}><label>Invitation token<input required value={invitationToken} onChange={event => setInvitationToken(event.target.value)} placeholder="Paste your invitation token" /></label><button disabled={settingsBusy}>Join workspace</button></form>
+        </section>}
+        {settingsTab === 'developer' && <section className="settings-section">
+          <div className="settings-section-heading"><div><h2>API keys</h2><p>Keys are displayed once. Revoking one stops future requests immediately.</p></div><KeyRound size={18} /></div>
+          {workspaceInfo?.role === 'owner' && <form className="settings-form single" onSubmit={createApiKey}><label>Key name<input required maxLength={80} value={settingsKeyName} onChange={event => setSettingsKeyName(event.target.value)} placeholder="My integration" /></label><button disabled={settingsBusy}>Create key</button></form>}
+          <div className="settings-list">{apiKeys.map(key => <div key={key.id}><span><strong>{key.name}</strong><small>{key.key_prefix} · {key.revoked_at ? 'Revoked' : key.last_used_at ? `Last used ${new Date(key.last_used_at * 1000).toLocaleString()}` : 'Never used'}</small></span>{!key.revoked_at && <button onClick={() => revokeApiKey(key)}>Revoke</button>}</div>)}{!apiKeys.length && <p>No API keys created.</p>}</div>
+          <div className="settings-section-heading webhook-heading"><div><h2>Webhooks</h2><p>Receive signed HTTPS events when a video is ready, an import fails, or a review changes.</p></div><Webhook size={18} /></div>
+          {workspaceInfo?.role === 'owner' && <form className="settings-form single" onSubmit={createWebhook}><label>HTTPS endpoint<input type="url" required value={settingsWebhookUrl} onChange={event => setSettingsWebhookUrl(event.target.value)} placeholder="https://your-service.example/events" /></label><fieldset><legend>Events</legend>{[['video.ready', 'Video ready'], ['import.failed', 'Import failed'], ['review.updated', 'Review updated']].map(([value, label]) => <label key={value}><input type="checkbox" checked={settingsWebhookEvents.includes(value)} onChange={event => setSettingsWebhookEvents(items => event.target.checked ? [...items, value] : items.filter(item => item !== value))} />{label}</label>)}</fieldset><button disabled={settingsBusy || !settingsWebhookEvents.length}>Add webhook</button></form>}
+          <div className="settings-list">{webhooks.map(hook => <div key={hook.id}><span><strong>{new URL(hook.url).host}</strong><small>{hook.events.join(' · ')}</small></span><button onClick={() => sendWebhookTest(hook)}>Send test</button><button onClick={() => removeWebhook(hook)}>Disable</button></div>)}{!webhooks.length && <p>No webhooks configured.</p>}</div>
+        </section>}
+        {settingsTab === 'activity' && <section className="settings-section">
+          <div className="settings-section-heading"><div><h2>Processing activity</h2><p>Imports, video timelines, and transcripts across this workspace.</p></div><button className="text-action" onClick={loadSettings}>Refresh</button></div>
+          <div className="settings-list job-list">{queueJobs.map(job => <div key={`${job.kind}-${job.id}`}><span><strong>{job.kind === 'import' ? 'Link import' : job.kind === 'analysis' ? 'Video timeline' : 'Transcript'} · {job.status}</strong><small>{job.detail || job.error || `${job.progress || 0}% · ${job.name}`}</small></span>{job.status === 'failed' && <button onClick={async () => { try { const path = job.kind === 'import' ? `/api/imports/${job.id}/retry` : `/api/videos/${job.video_id}/${job.kind === 'analysis' ? 'analysis' : 'transcript'}/retry`; await settingsRequest(path, { method: 'POST' }); await loadSettings(); } catch (error) { setSettingsError(error.message); } }}>Retry</button>}{job.kind === 'import' && ['queued', 'processing'].includes(job.status) && <button onClick={async () => { try { await settingsRequest(`/api/imports/${job.id}/cancel`, { method: 'POST' }); await loadSettings(); } catch (error) { setSettingsError(error.message); } }}>Cancel</button>}</div>)}{!queueJobs.length && <p>No recent processing jobs.</p>}</div>
+          <div className="workspace-facts"><span>Active jobs <strong>{queueJobs.filter(job => ['queued', 'processing'].includes(job.status)).length}</strong></span><span>Failed recently <strong>{queueJobs.filter(job => job.status === 'failed').length}</strong></span><span>Account role <strong>{workspaceInfo?.role || '—'}</strong></span></div>
+        </section>}
+      </main>}
+
       {page === 'compare' && comparison && <main className="compare-page">
         <div className="page-heading"><div><span className="overline">VIDEO COMPARISON</span><h1>What changed between them</h1><p>{comparison.summary}</p></div><button className="text-action" onClick={() => setPage('library')}>Back to library</button></div>
         <div className="compare-headings">{comparison.videos.map(video => <button key={video.id} onClick={() => openComparisonMoment(video.id)}><strong>{video.name}</strong><span>{formatTime(video.duration)} · {video.scene_count} moments · {video.transcript_segment_count} transcript lines</span></button>)}</div>
@@ -1181,7 +1372,7 @@ function WorkspaceApp({ previewMode = false, onRequestSignIn = () => {} }) {
               <button className="conversation-new" onClick={newConversation}>New</button>
               {showConversations && <div className="conversation-list">{conversations.length === 0 ? <span>No saved conversations yet</span> : conversations.map(item => editingConversationId === item.id ? <form key={item.id} onSubmit={event => renameConversation(event, item)}><input autoFocus value={conversationDraft} onChange={event => setConversationDraft(event.target.value)} maxLength={120} aria-label={`Rename ${item.title}`} /><button type="submit">Save</button><button type="button" onClick={() => setEditingConversationId('')}>Cancel</button></form> : <div key={item.id} className={item.id === conversationId ? 'active' : ''}><button onClick={() => selectConversation(item)}><strong>{item.title}</strong><small>{item.message_count} messages</small></button>{pendingConversationDeleteId === item.id ? <><button className="conversation-rename" onClick={() => deleteConversation(item)}>Confirm</button><button className="conversation-rename" onClick={() => setPendingConversationDeleteId('')}>Cancel</button></> : <><button className="conversation-rename" onClick={() => { setEditingConversationId(item.id); setConversationDraft(item.title); setPendingConversationDeleteId(''); }}>Rename</button><button className="conversation-rename" onClick={() => { setPendingConversationDeleteId(item.id); setEditingConversationId(''); }}>Delete</button></>}</div>)}</div>}
             </div>}
-            {panel === 'transcript' ? <div className="transcript-panel"><span className="ai-chip">TRANSCRIPT</span><h2>Search what was said</h2><form onSubmit={event => { event.preventDefault(); if (videoId) void loadTranscript(videoId, transcriptQuery); }}><Search size={14} /><input value={transcriptQuery} onChange={event => setTranscriptQuery(event.target.value)} placeholder="Search transcript" disabled={!videoId} /><button type="submit" disabled={!videoId || transcriptLoading}>{transcriptLoading ? 'Searching…' : 'Search'}</button>{transcriptQuery && <button type="button" onClick={() => { setTranscriptQuery(''); if (videoId) void loadTranscript(videoId, ''); }}>Clear</button>}</form>{transcriptChapters.length > 0 && !transcriptQuery && <div className="transcript-chapters"><span>CHAPTERS</span>{transcriptChapters.map(chapter => <button key={chapter.id} onClick={() => seekTo(chapter.start_seconds)}><time>{formatTime(chapter.start_seconds)}</time>{chapter.title}</button>)}</div>}{transcriptStatus === 'ready' && transcriptSegments.length > 0 ? <div className="transcript-results">{transcriptSegments.map(segment => <div key={segment.id} className={segment.highlighted ? 'highlighted' : ''}><button onClick={() => seekTo(segment.start_seconds)}><span>{formatTime(segment.start_seconds)}{segment.speaker ? ` · ${segment.speaker}` : ''}</span><p>{segment.text}</p></button><button onClick={() => toggleTranscriptHighlight(segment)}>{segment.highlighted ? 'Remove highlight' : 'Highlight quote'}</button></div>)}</div> : transcriptStatus === 'ready' && transcriptQuery ? <p className="transcript-empty">No transcript lines match “{transcriptQuery}”.</p> : transcriptStatus === 'queued' || transcriptStatus === 'processing' ? <p className="transcript-empty">Preparing the searchable transcript…</p> : transcriptStatus === 'not_configured' ? <div className="transcript-status"><strong>Local transcription needs attention</strong><p>{transcriptError || 'Install the local speech models or configure another transcription provider.'}</p></div> : transcriptStatus === 'no_audio' || transcriptStatus === 'no_speech' || transcriptStatus === 'not_applicable' ? <div className="transcript-status"><strong>No spoken transcript is available</strong><p>{transcriptError || 'This video does not contain detectable speech.'}</p></div> : transcriptStatus === 'failed' ? <div className="transcript-status"><strong>Transcription stopped</strong><p>{transcriptError}</p><button onClick={retryTranscript}>Retry transcript</button></div> : <p className="transcript-empty">Open a saved video to search its transcript.</p>}</div> : panel === 'overview' ? <div className="overview-panel"><span className="ai-chip">OVERVIEW</span><h2>{overview.generated ? 'What the video shows' : 'Analysis status'}</h2><p>{overview.summary}</p><div className="overview-block"><span>VIDEO DETAILS</span><ul><li><Video size={14} />{fileName}</li><li><Clock3 size={14} />{formatTime(duration)} duration</li><li><ImageIcon size={14} />{overview.generated ? 'Grounded demo overview' : persistedScenes.length ? `${persistedScenes.length} evidence frames ready` : 'Semantic analysis needs a vision model'}</li></ul></div>{overview.tags?.length > 0 && <div className="topic-tags">{overview.tags.map(tag => <span key={tag}>{tag}</span>)}</div>}{videoId && <><div className="video-tag-section"><span>LIBRARY TAGS</span><form onSubmit={addTag}><input value={tagDraft} onChange={event => setTagDraft(event.target.value)} placeholder="Add a searchable tag" maxLength={40} /><button type="submit" disabled={!tagDraft.trim()}>Add</button></form>{videoTags.length > 0 && <div>{videoTags.map(tag => <button key={tag} onClick={() => removeTag(tag)} title={`Remove ${tag}`}>{tag} ×</button>)}</div>}</div><div className="overview-actions"><button onClick={shareCurrentMoment}><Link2 size={12} />Share {formatTime(currentTime)}</button><button onClick={() => downloadPrivate("/api/videos/" + videoId + "/clip?start=" + Math.max(0, currentTime - 5) + "&duration=30", fileName + "-clip.mp4")}><Download size={12} />Download 30s clip</button><button onClick={() => downloadPrivate("/api/videos/" + videoId + "/export?format=html&template=brief", fileName + "-report.html")}><Download size={12} />Export report</button>{lastShareUrl && <a href={lastShareUrl}>Open shared link</a>}</div><div className="annotation-section"><span>TIMESTAMPED NOTES</span><form onSubmit={addAnnotation}><input value={annotationDraft} onChange={event => setAnnotationDraft(event.target.value)} placeholder={`Add a note at ${formatTime(currentTime)}`} maxLength={1000} /><button type="submit" disabled={!annotationDraft.trim()}>Save</button></form>{annotations.length === 0 ? <p>No notes yet.</p> : annotations.map(annotation => <div key={annotation.id}><button onClick={() => seekTo(annotation.timestamp)}>{formatTime(annotation.timestamp)}</button><p>{annotation.note}</p><button onClick={() => removeAnnotation(annotation.id)}>Remove</button></div>)}</div></>}</div> :
+        {panel === 'transcript' ? <div className="transcript-panel"><span className="ai-chip">TRANSCRIPT</span><h2>Search what was said</h2>{videoId && <div className="subtitle-links"><button onClick={() => downloadPrivate(`/api/videos/${videoId}/export?format=srt`, `${fileName}-transcript.srt`)}>Download SRT</button><button onClick={() => downloadPrivate(`/api/videos/${videoId}/export?format=vtt`, `${fileName}-transcript.vtt`)}>Download VTT</button></div>}<form onSubmit={event => { event.preventDefault(); if (videoId) void loadTranscript(videoId, transcriptQuery); }}><Search size={14} /><input value={transcriptQuery} onChange={event => setTranscriptQuery(event.target.value)} placeholder="Search transcript" disabled={!videoId} /><button type="submit" disabled={!videoId || transcriptLoading}>{transcriptLoading ? 'Searching…' : 'Search'}</button>{transcriptQuery && <button type="button" onClick={() => { setTranscriptQuery(''); if (videoId) void loadTranscript(videoId, ''); }}>Clear</button>}</form>{transcriptChapters.length > 0 && !transcriptQuery && <div className="transcript-chapters"><span>CHAPTERS</span>{transcriptChapters.map(chapter => <button key={chapter.id} onClick={() => seekTo(chapter.start_seconds)}><time>{formatTime(chapter.start_seconds)}</time>{chapter.title}</button>)}</div>}{transcriptStatus === 'ready' && transcriptSegments.length > 0 ? <div className="transcript-results">{transcriptSegments.map(segment => <div key={segment.id} className={segment.highlighted ? 'highlighted' : ''}><button onClick={() => seekTo(segment.start_seconds)}><span>{formatTime(segment.start_seconds)}{segment.speaker ? ` · ${segment.speaker}` : ''}</span><p>{segment.text}</p></button>{editingSegmentId === segment.id ? <div className="transcript-edit"><input value={segmentDraft.speaker} placeholder="Speaker name" onChange={event => setSegmentDraft({ ...segmentDraft, speaker: event.target.value })} /><textarea value={segmentDraft.text} onChange={event => setSegmentDraft({ ...segmentDraft, text: event.target.value })} /><button onClick={() => saveTranscriptSegment(segment)}>Save edits</button><button onClick={() => setEditingSegmentId('')}>Cancel</button></div> : <div className="transcript-line-actions"><button onClick={() => { setEditingSegmentId(segment.id); setSegmentDraft({ text: segment.text, speaker: segment.speaker || '' }); }}>Edit line / speaker</button><button onClick={() => toggleTranscriptHighlight(segment)}>{segment.highlighted ? 'Remove highlight' : 'Highlight quote'}</button></div>}</div>)}</div> : transcriptStatus === 'ready' && transcriptQuery ? <p className="transcript-empty">No transcript lines match “{transcriptQuery}”.</p> : transcriptStatus === 'queued' || transcriptStatus === 'processing' ? <p className="transcript-empty">Preparing the searchable transcript…</p> : transcriptStatus === 'not_configured' ? <div className="transcript-status"><strong>Local transcription needs attention</strong><p>{transcriptError || 'Install the local speech models or configure another transcription provider.'}</p></div> : transcriptStatus === 'no_audio' || transcriptStatus === 'no_speech' || transcriptStatus === 'not_applicable' ? <div className="transcript-status"><strong>No spoken transcript is available</strong><p>{transcriptError || 'This video does not contain detectable speech.'}</p></div> : transcriptStatus === 'failed' ? <div className="transcript-status"><strong>Transcription stopped</strong><p>{transcriptError}</p><button onClick={retryTranscript}>Retry transcript</button></div> : <p className="transcript-empty">Open a saved video to search its transcript.</p>}</div> : panel === 'overview' ? <div className="overview-panel"><span className="ai-chip">OVERVIEW</span><h2>{overview.generated ? 'What the video shows' : 'Analysis status'}</h2><p>{overview.summary}</p><div className="overview-block"><span>VIDEO DETAILS</span><ul><li><Video size={14} />{fileName}</li><li><Clock3 size={14} />{formatTime(duration)} duration</li><li><ImageIcon size={14} />{overview.generated ? 'Grounded demo overview' : persistedScenes.length ? `${persistedScenes.length} evidence frames ready` : 'Semantic analysis needs a vision model'}</li></ul></div>{overview.tags?.length > 0 && <div className="topic-tags">{overview.tags.map(tag => <span key={tag}>{tag}</span>)}</div>}{videoId && <><div className="video-tag-section"><span>LIBRARY TAGS</span><form onSubmit={addTag}><input value={tagDraft} onChange={event => setTagDraft(event.target.value)} placeholder="Add a searchable tag" maxLength={40} /><button type="submit" disabled={!tagDraft.trim()}>Add</button></form>{videoTags.length > 0 && <div>{videoTags.map(tag => <button key={tag} onClick={() => removeTag(tag)} title={`Remove ${tag}`}>{tag} ×</button>)}</div>}</div><div className="overview-actions"><button onClick={shareCurrentMoment}><Link2 size={12} />Share {formatTime(currentTime)}</button><button onClick={() => downloadPrivate("/api/videos/" + videoId + "/clip?start=" + Math.max(0, currentTime - 5) + "&duration=30", fileName + "-clip.mp4")}><Download size={12} />Download 30s clip</button><button onClick={() => downloadPrivate("/api/videos/" + videoId + "/export?format=html&template=brief", fileName + "-report.html")}><Download size={12} />Export report</button><button onClick={() => downloadPrivate(`/api/videos/${videoId}/export?format=srt`, `${fileName}-transcript.srt`)}>SRT</button><button onClick={() => downloadPrivate(`/api/videos/${videoId}/export?format=vtt`, `${fileName}-transcript.vtt`)}>VTT</button>{lastShareUrl && <a href={lastShareUrl}>Open shared link</a>}</div><div className="annotation-section"><span>TIMESTAMPED NOTES</span><form onSubmit={addAnnotation}><input value={annotationDraft} onChange={event => setAnnotationDraft(event.target.value)} placeholder={`Add a note at ${formatTime(currentTime)}`} maxLength={1000} /><button type="submit" disabled={!annotationDraft.trim()}>Save</button></form>{annotations.length === 0 ? <p>No notes yet.</p> : annotations.map(annotation => <div key={annotation.id}><button onClick={() => seekTo(annotation.timestamp)}>{formatTime(annotation.timestamp)}</button><p>{annotation.note}</p><button onClick={() => removeAnnotation(annotation.id)}>Remove</button></div>)}</div><div className="annotation-section review-tools"><span>REVIEW</span><label>Status<select value={review.state} onChange={event => updateReview({ state: event.target.value })}><option value="draft">Draft</option><option value="in_review">In review</option><option value="approved">Approved</option><option value="changes_requested">Changes requested</option></select></label><label>Assignee<input value={review.assignee || ''} maxLength={120} placeholder="Name or email" onChange={event => setReview({ ...review, assignee: event.target.value })} onBlur={() => updateReview({ assignee: review.assignee || '' })} /></label><form onSubmit={addReviewComment}><input value={reviewCommentDraft} onChange={event => setReviewCommentDraft(event.target.value)} maxLength={2000} placeholder={`Comment at ${formatTime(currentTime)}`} /><button disabled={!reviewCommentDraft.trim()}>Comment</button></form>{reviewComments.map(comment => <div key={comment.id}><button onClick={() => comment.timestamp != null && seekTo(comment.timestamp)}>{comment.timestamp == null ? 'Note' : formatTime(comment.timestamp)}</button><p>{comment.body}</p></div>)}</div><div className="annotation-section retention-tools"><span>RETENTION</span><form onSubmit={saveRetention}><select value={retentionDays} onChange={event => setRetentionDays(event.target.value)}><option value="">Keep until I delete it</option><option value="30">Delete after 30 days</option><option value="90">Delete after 90 days</option><option value="365">Delete after 1 year</option></select><button>Save</button></form><p>Expired videos and their derived files are permanently removed automatically.</p></div></>}</div> :
             processing ? <div className="panel-empty"><span className="ai-loader"><span>•••</span></span><h2>Building the timeline</h2><p>This job is saved, so you can leave and return while the evidence frames are prepared.</p></div> : analysisStatus === 'failed' ? <div className="panel-empty focused-failure"><span className="ai-chip">IMPORT ISSUE</span><h2>{sourceType === 'url' ? 'Repair this web video' : 'Timeline extraction stopped'}</h2><p>{sourceType === 'url' ? 'The saved download is missing a playable video track. The original link is still available.' : analysisError || 'The video could not be decoded.'}</p><button onClick={sourceType === 'url' ? repairRemoteImport : retryAnalysis} disabled={repairingImport}>{sourceType === 'url' ? repairingImport ? 'Repairing…' : 'Repair web import' : 'Retry timeline'}</button>{sourceType === 'url' && sourceUrl && <a href={sourceUrl} target="_blank" rel="noreferrer">Open original link</a>}</div> : messages.length === 0 ? <div className="panel-ready"><span className="ai-chip">VIDEO READY</span><h2>What do you want to know?</h2><p>{sourceType === 'demo' || videoId ? 'Ask about a scene, a change, or a detail. Grounded answers link back to the moment.' : 'The video is open locally. Connect the API and a vision model for grounded answers.'}</p><div className="suggestion-list">{promptSuggestions.map(prompt => <button key={prompt} onClick={() => ask(prompt)}><span>{prompt}</span><ArrowUp size={13} /></button>)}</div><div className="mini-overview"><div>{sourceType === 'demo' ? <img src="/demo/scene-waterfall.jpg" alt="Waterfall scene" /> : persistedScenes[0]?.image && <img src={persistedScenes[0].image} alt="" />}<span><strong>{sourceType === 'demo' ? '4 moments mapped' : persistedScenes.length ? `${persistedScenes.length} evidence frames` : 'Timeline available'}</strong><small>{sourceType === 'demo' ? 'Landscape · movement · light' : persistedScenes.length ? 'Extracted from this video' : 'Semantic analysis needs a vision model'}</small></span></div><button onClick={() => setPanel('overview')}>Open overview <ChevronRight size={12} /></button></div></div> :
             <div className="messages">{messages.map((message, index) => <div key={message.id || index} className={`message ${message.role}`}>{message.role === 'assistant' && <span className="assistant-avatar">U</span>}<div><span className="message-author">{message.role === 'assistant' ? 'UNDERSTAND' : 'YOU'}</span><p>{message.role === 'assistant' ? <TimestampText text={message.text} onSeek={seekTo} /> : message.text}</p></div></div>)}{streaming && <span className="thinking"><i />Reading the scene…</span>}<div ref={chatEndRef} /></div>}
           </div>

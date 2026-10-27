@@ -96,14 +96,20 @@ existing video conversation without cross-account data exposure.
 Success check: 95th-percentile chat response begins within two seconds after a
 video is ready, with no lost jobs during worker restarts.
 
-## Milestone 4 — Differentiating workflows
+## Milestone 4 — Differentiating workflows (partially shipped)
 
-- Extend shipped full-library text search with semantic and tag search.
-- Extend shipped structural two-video comparison with grounded semantic changes.
-- Speaker-aware transcripts, chapters, highlights, and shareable clips.
-- Extend shipped timestamped notes and exact-moment links with team assignments.
-- Extend shipped Markdown/JSON exports with support-ticket and content-brief templates.
-- API keys and webhooks for programmatic ingestion and completed analyses.
+- Full-library text search, tags, transcript speakers, chapters, quote
+  highlights, per-line transcript/speaker correction, and SRT/VTT downloads.
+- Structural two-video comparison; semantic comparison grounded in evidence
+  from both videos remains.
+- Timestamped notes, exact-moment share links, bounded clip downloads, team
+  assignments, review states, and comments.
+- Markdown, JSON, and styled HTML report templates for research, review,
+  support-ticket, and content-brief use; native PDF output remains.
+- API keys, signed webhooks, workspace invitations, and processing-job controls
+  are available in the workspace interface.
+- Semantic search, share collections and access controls, and durable webhook
+  delivery history remain.
 
 ## Release discipline
 

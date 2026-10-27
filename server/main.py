@@ -197,6 +197,26 @@ class CommentCreateRequest(BaseModel):
         return value.strip()
 
 
+class TranscriptSegmentUpdateRequest(BaseModel):
+    text: str | None = Field(default=None, min_length=1, max_length=4000)
+    speaker: str | None = Field(default=None, max_length=120)
+
+    @field_validator("text")
+    @classmethod
+    def clean_transcript_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("Transcript text cannot be empty")
+        return normalized
+
+    @field_validator("speaker")
+    @classmethod
+    def clean_speaker(cls, value: str | None) -> str | None:
+        return value.strip() or None if value is not None else None
+
+
 class ApiKeyCreateRequest(BaseModel):
     name: str = Field(min_length=1, max_length=80)
 
@@ -1392,6 +1412,37 @@ def metrics() -> dict:
     }
 
 
+@app.get("/api/jobs")
+def list_processing_jobs(limit: int = Query(default=50, ge=1, le=200)) -> list[dict]:
+    with db() as connection:
+        rows = connection.execute(
+            """
+            SELECT kind, id, video_id, name, status, progress, detail, error, updated_at FROM (
+              SELECT 'import' AS kind, import_jobs.id, import_jobs.video_id,
+                     import_jobs.source_url AS name, import_jobs.status, import_jobs.progress,
+                     import_jobs.detail, import_jobs.error, import_jobs.updated_at
+              FROM import_jobs LEFT JOIN videos ON videos.id = import_jobs.video_id
+              WHERE import_jobs.workspace_id = ?
+              UNION ALL
+              SELECT 'analysis' AS kind, analysis_jobs.id, analysis_jobs.video_id,
+                     videos.name, analysis_jobs.status, analysis_jobs.progress,
+                     NULL AS detail, analysis_jobs.error, analysis_jobs.updated_at
+              FROM analysis_jobs JOIN videos ON videos.id = analysis_jobs.video_id
+              WHERE videos.workspace_id = ?
+              UNION ALL
+              SELECT 'transcript' AS kind, transcript_jobs.id, transcript_jobs.video_id,
+                     videos.name, transcript_jobs.status,
+                     CASE WHEN transcript_jobs.status = 'ready' THEN 100 ELSE 0 END AS progress,
+                     NULL AS detail, transcript_jobs.error, transcript_jobs.updated_at
+              FROM transcript_jobs JOIN videos ON videos.id = transcript_jobs.video_id
+              WHERE videos.workspace_id = ?
+            ) jobs ORDER BY updated_at DESC LIMIT ?
+            """,
+            (active_workspace_id(), active_workspace_id(), active_workspace_id(), limit),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
 @app.get("/api/config")
 def public_config() -> dict:
     transcription_provider = os.getenv("TRANSCRIPTION_PROVIDER", "local").strip().lower()
@@ -1445,6 +1496,25 @@ def current_workspace() -> dict:
     if not workspace:
         raise HTTPException(status_code=404, detail="Workspace not found")
     return {**dict(workspace), "mode": "supabase" if using_postgres() else "local-development"}
+
+
+@app.get("/api/workspaces")
+def list_workspaces() -> list[dict]:
+    with db() as connection:
+        rows = connection.execute(
+            """
+            SELECT workspaces.id, workspaces.name, workspace_members.role,
+                   COUNT(DISTINCT videos.id) AS video_count
+            FROM workspace_members
+            JOIN workspaces ON workspaces.id = workspace_members.workspace_id
+            LEFT JOIN videos ON videos.workspace_id = workspaces.id
+            WHERE workspace_members.account_id = ?
+            GROUP BY workspaces.id, workspaces.name, workspace_members.role
+            ORDER BY workspaces.created_at, workspaces.name
+            """,
+            (active_account_id(),),
+        ).fetchall()
+    return [dict(row) for row in rows]
 
 
 @app.get("/api/workspace/invitations")
@@ -2020,7 +2090,7 @@ def list_videos(q: str = Query(default="", max_length=200)) -> list[dict]:
             """
             SELECT
               videos.id, videos.name, videos.size_bytes, videos.duration, videos.width, videos.height,
-              videos.status, videos.created_at, videos.source_type, videos.source_url,
+              videos.status, videos.created_at, videos.source_type, videos.source_url, videos.expires_at,
               COALESCE(analysis_jobs.status, CASE WHEN videos.source_type = 'demo' THEN 'ready' ELSE 'queued' END) AS analysis_status,
               COALESCE(analysis_jobs.progress, CASE WHEN videos.source_type = 'demo' THEN 100 ELSE 0 END) AS analysis_progress,
               (SELECT GROUP_CONCAT(tag, '|||') FROM video_tags WHERE video_tags.video_id = videos.id) AS tag_list,
@@ -2311,6 +2381,30 @@ def video_transcript(video_id: str, q: str | None = Query(default=None, max_leng
     return {"video_id": video_id, "query": query, "job": job_payload, "chapters": [dict(chapter) for chapter in chapters], "segments": [dict(segment) for segment in segments]}
 
 
+@app.patch("/api/videos/{video_id}/transcript/segments/{segment_id}")
+def update_transcript_segment(video_id: str, segment_id: str, payload: TranscriptSegmentUpdateRequest) -> dict:
+    video_record(video_id)
+    changes = payload.model_dump(exclude_unset=True)
+    if not changes:
+        raise HTTPException(status_code=400, detail="Provide transcript text or a speaker name")
+    with db() as connection:
+        segment = connection.execute(
+            "SELECT id, position, start_seconds, end_seconds, text, speaker FROM transcript_segments WHERE id = ? AND video_id = ?",
+            (segment_id, video_id),
+        ).fetchone()
+        if not segment:
+            raise HTTPException(status_code=404, detail="Transcript line not found")
+        connection.execute(
+            "UPDATE transcript_segments SET text = ?, speaker = ? WHERE id = ? AND video_id = ?",
+            (changes.get("text", segment["text"]), changes.get("speaker", segment["speaker"]), segment_id, video_id),
+        )
+        updated = connection.execute(
+            "SELECT id, position, start_seconds, end_seconds, text, speaker FROM transcript_segments WHERE id = ? AND video_id = ?",
+            (segment_id, video_id),
+        ).fetchone()
+    return dict(updated)
+
+
 @app.post("/api/videos/{video_id}/transcript/highlights/{segment_id}", status_code=201)
 def highlight_transcript_segment(video_id: str, segment_id: str) -> dict:
     video_record(video_id)
@@ -2432,7 +2526,7 @@ def delete_annotation(video_id: str, annotation_id: str) -> Response:
 @app.get("/api/videos/{video_id}/export")
 def export_video_notes(
     video_id: str,
-    format: str = Query(default="markdown", pattern="^(markdown|json|html)$"),
+    format: str = Query(default="markdown", pattern="^(markdown|json|html|srt|vtt)$"),
     template: str = Query(default="brief", pattern="^(brief|research|review|support-ticket|content-brief)$"),
     conversation_id: str | None = Query(default=None, max_length=64, pattern=r"^[a-zA-Z0-9_-]+$"),
 ) -> Response:
@@ -2479,6 +2573,27 @@ def export_video_notes(
         "template": template,
     }
     filename = safe_name(Path(video["name"]).stem) or "video-notes"
+    if format in {"srt", "vtt"}:
+        def subtitle_time(value: float, separator: str) -> str:
+            milliseconds = max(0, round(float(value) * 1000))
+            hours, remainder = divmod(milliseconds, 3_600_000)
+            minutes, remainder = divmod(remainder, 60_000)
+            seconds, millis = divmod(remainder, 1000)
+            return f"{hours:02d}:{minutes:02d}:{seconds:02d}{separator}{millis:03d}"
+
+        blocks = []
+        for index, segment in enumerate(transcript, 1):
+            speaker = f"{segment['speaker']}: " if segment.get("speaker") else ""
+            blocks.append(
+                f"{index if format == 'srt' else index}\n"
+                f"{subtitle_time(segment['start_seconds'], ',' if format == 'srt' else '.')} --> "
+                f"{subtitle_time(segment['end_seconds'], ',' if format == 'srt' else '.')}\n"
+                f"{speaker}{segment['text']}"
+            )
+        document = ("WEBVTT\n\n" if format == "vtt" else "") + "\n\n".join(blocks) + "\n"
+        extension = format
+        media_type = "text/vtt; charset=utf-8" if format == "vtt" else "application/x-subrip; charset=utf-8"
+        return Response(document, media_type=media_type, headers={"Content-Disposition": f'attachment; filename="{filename}.{extension}"'})
     if format == "json":
         return Response(
             json.dumps(payload, ensure_ascii=False, indent=2),

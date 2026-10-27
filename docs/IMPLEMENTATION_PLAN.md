@@ -1,6 +1,6 @@
 # UnderstandVideo implementation plan
 
-Updated: 19 October 2026
+Updated: 27 October 2026
 
 ## Goal
 
@@ -68,6 +68,9 @@ request process and is not yet connected as a production inference worker.
 | Durable quotas | Rate limits disappeared on every restart and were keyed to an IP. | Hourly counters persist in the configured database and are keyed to the active account and action. |
 | Reliability | Processing depended on the API process and had no browser/CI gate. | A standalone persisted job worker, request timing/queue metrics, desktop/mobile Playwright tests, and GitHub Actions checks are included. |
 | Review and delivery | Review status, comments, clips, and polished reports were absent. | Review state/assignee/comment APIs, downloadable clips, styled HTML reports, conversation-specific exports, workspace invitations, and working API-key authentication are implemented. |
+| Workspace workflows | Team, integration, and queue APIs were not reachable from the product. | Added a workspace screen for switching memberships, invitations, API-key creation/revocation, signed webhook setup/test/disable, and import/timeline/transcript job status with retry and import cancellation. |
+| Transcript correction | Speaker labels and transcript text could not be corrected after transcription. | Added per-line transcript/speaker editing and timestamp-preserving SRT/WebVTT downloads. |
+| Retention and review interface | Retention, review state, assignee, and timestamp comments existed only as APIs. | Exposed these controls in the saved-video overview, using each video's stored expiry date. |
 
 ## Phase 1 — Make analysis real and durable
 
@@ -148,12 +151,19 @@ Acceptance criteria:
 
 ## Phase 5 — Differentiating product features
 
-- Compare two videos and explain changes with paired timestamps.
-- Speaker-aware transcript navigation and quote search.
-- Shareable links that open at an exact cited moment.
-- Structured exports for research notes, support tickets, and content briefs.
-- Team annotations, assignments, and review states.
-- API keys and webhooks for programmatic ingestion.
+- Structural video comparison with paired timeline moments is shipped; grounded
+  semantic change explanations remain.
+- Speaker labels, transcript navigation, quote highlights, and search are
+  shipped; transcript correction and SRT/VTT exports are now exposed in the UI.
+- Expiring exact-moment share links are shipped; multi-moment collections,
+  password protection, revocation, and view analytics remain.
+- Markdown, JSON, and styled HTML exports with support, research, review, and
+  content-brief templates are shipped; native PDF output remains.
+- Team invitations, timestamped notes/comments, assignees, and review states are
+  shipped and available through workspace/video screens.
+- API-key lifecycle, webhook registration, signing, event fan-out, and test
+  delivery are shipped; an independently monitored durable delivery ledger
+  remains deployment work.
 
 ## Still hardcoded by design
 
@@ -174,6 +184,30 @@ Replace the local development identity with verified authentication, then add an
 S3-compatible storage implementation. Then connect the shipped worker contract
 to local Video-ChatGPT and extend structural comparison with grounded semantic
 change explanations.
+
+## Remaining after the October 27 interface pass
+
+Implemented in code and available through the product: workspace switching,
+invitations, integration settings, processing-job recovery, transcript and
+speaker correction, subtitle downloads, retention controls, review state,
+assignees, and timestamped review comments.
+
+Still requiring implementation or deployment work:
+
+- Semantic comparison grounded in frames from both videos. Current comparison
+  is structural and can report transcript term overlap.
+- Semantic search and model-generated chapter titles. Search currently matches
+  stored text and chapter titles are deterministic.
+- Multi-moment share collections, password protection, revocation, view
+  analytics, and selectable clip trimming. Current shares target one moment.
+- PDF report generation and workspace branding. Browser printing is available
+  for the current HTML report.
+- The hardened Compose stack, managed PostgreSQL/Redis, and durable shared
+  worker storage must be deployed outside the no-card staging service.
+- Required malware scanning on the public service, isolated per-file decoding,
+  backup/restore drills, and external monitoring credentials.
+- A labeled sample of representative videos to measure speaker and answer
+  quality before tuning.
 
 ## What Aarav needs to provide for transcript quality and production security
 

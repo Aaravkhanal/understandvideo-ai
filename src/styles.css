@@ -462,10 +462,72 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 .auth-page > .legal-links { margin-top: auto; }
 .app-legal-links { position: fixed; z-index: 40; right: 28px; bottom: 25px; }
 
+.settings-page { min-width: 0; overflow-y: auto; padding: 44px 48px 72px; scrollbar-width: thin; }
+.settings-page > .page-heading { max-width: 900px; margin: 0 auto; }
+.settings-tabs { max-width: 900px; margin: 30px auto 0; border-bottom: 1px solid var(--rule); display: flex; gap: 24px; }
+.settings-tabs button { padding: 0 0 11px; border: 0; border-bottom: 1px solid transparent; background: transparent; color: #777670; font-size: 10px; cursor: pointer; }
+.settings-tabs button.active { border-bottom-color: var(--ink); color: var(--ink); }
+.settings-section { max-width: 900px; margin: 0 auto; }
+.workspace-picker { max-width: 900px; margin: 22px auto 0; display: flex; align-items: center; gap: 12px; color: #777670; font-size: 9px; }
+.workspace-picker select { min-width: 210px; padding: 4px 0; border: 0; border-bottom: 1px solid var(--ink); border-radius: 0; background: transparent; color: var(--ink); font-size: 9px; }
+.settings-section-heading { margin-top: 28px; display: flex; align-items: start; justify-content: space-between; gap: 20px; }
+.settings-section-heading h2 { margin: 0; font: 500 18px 'Manrope'; letter-spacing: -.4px; }
+.settings-section-heading p { margin: 6px 0 0; color: #777670; font-size: 9px; line-height: 1.6; }
+.settings-section-heading > span { color: #777670; font-size: 9px; }
+.settings-form { margin-top: 18px; padding: 14px 0; border-top: 1px solid var(--rule); border-bottom: 1px solid var(--rule); display: grid; grid-template-columns: minmax(170px, 1fr) 140px auto; gap: 16px; align-items: end; }
+.settings-form.single { grid-template-columns: minmax(200px, 1fr) auto; }
+.settings-form label { display: grid; gap: 7px; color: #777670; font-size: 8px; }
+.settings-form input, .settings-form select, .settings-section input, .settings-section select { min-width: 0; height: 33px; padding: 0 2px; border: 0; border-bottom: 1px solid #aaa9a3; border-radius: 0; background: transparent; color: var(--ink); font-size: 10px; }
+.settings-form > button, .settings-list button, .one-time-secret button { width: max-content; padding: 0 0 3px; border: 0; border-bottom: 1px solid var(--ink); background: transparent; color: var(--ink); font-size: 9px; cursor: pointer; }
+.settings-form button:disabled { opacity: .45; cursor: wait; }
+.settings-list { display: grid; }
+.settings-list > div { min-height: 52px; padding: 10px 0; border-bottom: 1px solid var(--rule); display: flex; align-items: center; gap: 18px; }
+.settings-list > div > span:first-child { min-width: 0; flex: 1; }
+.settings-list strong, .settings-list small { display: block; overflow-wrap: anywhere; }
+.settings-list strong { font-size: 10px; font-weight: 500; }
+.settings-list small { margin-top: 4px; color: #85847e; font-size: 8px; }
+.settings-list > div > span:last-child { color: #777670; font-size: 8px; }
+.settings-list > p { color: #85847e; font-size: 9px; }
+.workspace-facts { margin-top: 26px; border-top: 1px solid var(--ink); display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
+.workspace-facts span { padding-top: 12px; color: #85847e; font-size: 8px; }
+.workspace-facts strong { margin-top: 5px; display: block; color: var(--ink); font-size: 9px; font-weight: 500; }
+.webhook-heading { margin-top: 42px; padding-top: 22px; border-top: 1px solid var(--rule); }
+.settings-form fieldset { grid-column: 1 / -1; margin: 0; padding: 8px 0; border: 0; display: flex; flex-wrap: wrap; gap: 16px; }
+.settings-form legend { margin-bottom: 8px; color: #777670; font-size: 8px; }
+.settings-form fieldset label { display: flex; align-items: center; gap: 6px; }
+.settings-form fieldset input { width: 13px; height: 13px; }
+.settings-error { max-width: 900px; margin: 17px auto 0; color: #7a302a; font-size: 9px; }
+.one-time-secret { max-width: 900px; margin: 18px auto; padding: 12px 0; border-top: 1px solid var(--ink); border-bottom: 1px solid var(--ink); display: grid; gap: 9px; }
+.one-time-secret strong { font-size: 9px; font-weight: 500; }
+.one-time-secret code { overflow-wrap: anywhere; font: 9px/1.5 ui-monospace, monospace; }
+.one-time-secret button { justify-self: start; }
+.job-list small { white-space: normal; }
+.review-tools > label { margin-top: 10px; display: grid; grid-template-columns: 1fr 2fr; align-items: center; gap: 10px; color: #777670; font-size: 8px; }
+.review-tools > label select, .review-tools > label input { font-size: 9px; }
+.review-tools form, .retention-tools form { margin-top: 12px; padding-bottom: 7px; border-bottom: 1px solid var(--ink); display: flex; align-items: center; gap: 9px; }
+.review-tools form input, .retention-tools form select { min-width: 0; flex: 1; }
+.review-tools form button, .retention-tools form button { padding: 0; border: 0; border-bottom: 1px solid var(--ink); background: transparent; font-size: 8px; cursor: pointer; }
+.review-tools > div { padding: 9px 0; border-bottom: 1px solid var(--rule); display: grid; grid-template-columns: 46px 1fr; gap: 9px; }
+.review-tools > div > button { border: 0; background: transparent; color: #777670; font-size: 7px; text-align: left; cursor: pointer; }
+.review-tools > div p, .retention-tools > p { margin: 0; color: #55544f; font-size: 8px; line-height: 1.5; }
+.subtitle-links, .transcript-line-actions { display: flex; gap: 13px; }
+.subtitle-links { margin-top: 12px; }
+.subtitle-links button, .transcript-line-actions button, .transcript-edit button { padding: 0; border: 0; border-bottom: 1px solid currentColor; background: transparent; color: #55544f; font-size: 8px; cursor: pointer; }
+.transcript-line-actions { margin: 7px 0 0 71px; }
+.transcript-edit { margin: 8px 0 0 71px; display: grid; gap: 8px; }
+.transcript-edit textarea { min-height: 62px; padding: 7px 0; border: 0; border-bottom: 1px solid var(--ink); background: transparent; font-size: 9px; resize: vertical; }
+.transcript-edit input { padding: 5px 0; border: 0; border-bottom: 1px solid var(--rule); background: transparent; font-size: 9px; }
+.transcript-edit button { justify-self: start; }
+
 @media (max-width: 680px) {
   .auth-layout { display: block; margin: 50px 0; }
   .onboarding-steps { margin-top: 36px; }
   .auth-copy form { grid-template-columns: 1fr; }
   .auth-copy button { justify-self: start; }
   .account-signout { left: auto; right: 18px; bottom: 18px; }
+  .settings-page { padding: 28px 20px 50px; }
+  .settings-form, .settings-form.single { grid-template-columns: 1fr; gap: 12px; }
+  .settings-form fieldset { grid-column: auto; }
+  .workspace-facts { grid-template-columns: 1fr; gap: 0; }
+  .settings-section-heading { margin-top: 22px; }
 }

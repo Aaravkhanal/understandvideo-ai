@@ -94,6 +94,11 @@ available instead of inventing an answer.
 - Timestamped workspace notes, Markdown/JSON/premium HTML report exports,
   expiring exact-moment links, downloadable 30-second clips, local review states,
   assignments/comments, and side-by-side structural video comparison.
+- A workspace control screen for switching shared workspaces, creating and
+  tracking invitations, issuing and revoking API keys, configuring signed
+  webhooks, and reviewing or retrying background imports and analysis jobs.
+- Transcript correction and speaker-name editing, plus SRT and WebVTT subtitle
+  downloads from saved timestamped transcript segments.
 - MP4, MOV, WebM, and AVI uploads with configurable size and hourly limits.
 - Container-signature and decoder validation that rejects non-video files even
   when they use a supported filename or declared MIME type.
@@ -128,9 +133,19 @@ available instead of inventing an answer.
   per-file sandboxing can be added with short-lived jobs on the deployment platform.
 - Semantic embeddings remain deployment work. Workspace invitations, API-key
   authentication, and cross-workspace membership selection are connected.
-  Signed webhooks automatically fan out
-  video-ready, import-failed, and review-updated events with bounded retries.
-  Local API-key lifecycle and signed webhook registration/test delivery are available.
+  Signed webhooks automatically fan out video-ready, import-failed, and
+  review-updated events with bounded retries. Local API-key lifecycle and
+  signed webhook registration/test delivery are available. External delivery
+  monitoring and a durable retry ledger still need a production event service.
+- The settings screen shows the invitations this API created, and displays a
+  new invitation token once for the owner to share. It does not send invitation
+  email automatically.
+- The hosted no-card staging service runs best-effort malware scanning and
+  limited local transcription for memory reasons. Required malware scanning,
+  isolated decoding, reliable multi-host workers, backups, and monitoring need
+  the separately configured production stack and its secrets.
+- Team review controls are workspace-scoped, but comments do not yet have
+  individual edit/delete controls or notifications.
 
 The prioritized work is tracked in the
 [implementation plan](docs/IMPLEMENTATION_PLAN.md) and
@@ -385,6 +400,8 @@ the API and worker on a private network with the same durable processing volume.
 | `GET` | `/api/metrics` | Request timing, response counts, and queue depth. |
 | `GET` | `/api/config` | Public upload and request limits. |
 | `GET` | `/api/workspace` | Read the active local workspace and stored-video count. |
+| `GET` | `/api/workspaces` | List workspaces the signed-in account belongs to. |
+| `GET` | `/api/jobs` | List recent import, timeline, and transcript processing jobs. |
 | `POST` | `/api/videos/upload` | Validate and persist a video. |
 | `POST` | `/api/videos/import-url` | Import a supported public video link. |
 | `GET/POST` | `/api/imports` | List or start durable background link imports. |
@@ -400,13 +417,14 @@ the API and worker on a private network with the same durable processing volume.
 | `POST` | `/api/videos/{id}/analysis/retry` | Retry failed timeline extraction. |
 | `GET` | `/api/videos/{id}/scenes/{scene_id}/thumbnail` | Read a persisted evidence thumbnail. |
 | `GET` | `/api/videos/{id}/transcript` | Read or search timestamped transcript segments. |
+| `PATCH` | `/api/videos/{id}/transcript/segments/{segment_id}` | Correct transcript text or the speaker name. |
 | `POST/DELETE` | `/api/videos/{id}/transcript/highlights/{segment_id}` | Save or remove a quote highlight. |
 | `POST` | `/api/videos/{id}/transcript/retry` | Retry failed or newly configured transcription. |
 | `GET/POST` | `/api/videos/{id}/tags` | List or add searchable library tags. |
 | `DELETE` | `/api/videos/{id}/tags/{tag}` | Remove a library tag. |
 | `GET/POST` | `/api/videos/{id}/annotations` | List or create timestamped workspace notes. |
 | `DELETE` | `/api/videos/{id}/annotations/{annotation_id}` | Remove a timestamped note. |
-| `GET` | `/api/videos/{id}/export` | Download Markdown, JSON, or styled HTML reports. |
+| `GET` | `/api/videos/{id}/export` | Download Markdown, JSON, styled HTML, SRT, or WebVTT. |
 | `GET` | `/api/videos/{id}/clip` | Download a browser-compatible clip up to 120 seconds. |
 | `PATCH` | `/api/videos/{id}/retention` | Set or clear automatic permanent deletion. |
 | `GET/PUT` | `/api/videos/{id}/review` | Read or update review state and assignee. |
