@@ -113,6 +113,15 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 .import-status > i em { height: 1px; display: block; background: var(--ink); transition: width .2s ease; }
 .import-status > button { padding: 0 0 2px; border: 0; border-bottom: 1px solid currentColor; background: transparent; color: var(--ink); font-size: 8px; cursor: pointer; }
 .import-status > button:disabled { color: #999892; cursor: wait; }
+.youtube-preview { max-width: 1160px; margin: 20px auto 28px; }
+.youtube-preview-heading { display: flex; align-items: end; justify-content: space-between; gap: 16px; margin-bottom: 10px; }
+.youtube-preview-heading > div { display: grid; gap: 5px; }
+.youtube-preview-heading span { color: #85847e; font-size: 8px; letter-spacing: .14em; }
+.youtube-preview-heading strong { font-size: 15px; font-weight: 500; }
+.youtube-preview-heading a { display: inline-flex; align-items: center; gap: 6px; color: var(--ink); font-size: 10px; text-decoration: underline; text-underline-offset: 3px; }
+.youtube-preview-frame { width: min(100%, 800px); aspect-ratio: 16 / 9; background: #111; }
+.youtube-preview-frame iframe { width: 100%; height: 100%; display: block; border: 0; }
+.youtube-preview p { max-width: 800px; margin: 9px 0 0; color: #77766f; font-size: 10px; line-height: 1.6; }
 .import-hint { max-width: 1160px; margin: 0 auto; padding: 10px 0; border-bottom: 1px solid var(--rule); display: flex; gap: 12px; color: #777670; font-size: 8px; }
 .import-hint strong { color: var(--ink); font-weight: 500; }
 .import-hint.unsupported strong { text-decoration: underline; text-underline-offset: 3px; }
@@ -402,6 +411,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
   .url-import button { justify-self: start; }
   .import-status { flex-wrap: wrap; }
   .import-status > i { order: 3; width: 100%; }
+  .youtube-preview { margin: 16px 0 22px; }
   .dashboard-row { display: block; margin-top: 44px; }
   .media-grid { grid-template-columns: 1fr; }
   .add-card { min-height: 150px; }
