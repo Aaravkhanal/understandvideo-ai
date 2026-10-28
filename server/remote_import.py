@@ -166,8 +166,32 @@ def choose_platform_format(info: dict, max_bytes: int) -> str:
     ]
     choices.extend(((score[0], score[1], float(score[2])), format_id) for score, format_id in progressive)
     if not choices:
+        # Several extractors omit both filesize and bitrate metadata even when
+        # they expose a perfectly usable progressive MP4. Prefer that format
+        # over rejecting the link before attempting a download. Keep the
+        # fallback conservative because the actual size cannot be estimated;
+        # yt-dlp's max_filesize and our post-download check remain authoritative.
+        fallback_progressive = [
+            item for item in formats
+            if item.get("ext") == "mp4"
+            and is_h264(item)
+            and is_aac(item)
+            and 0 < height(item) <= 360
+        ]
+        if fallback_progressive:
+            return max(fallback_progressive, key=lambda item: height(item))["format_id"]
+
+        # Some sites expose H.264 video and AAC audio separately, also without
+        # size metadata. A low-resolution pair is still safer than failing
+        # every import from that extractor; the download size is checked below.
+        fallback_video = [item for item in video_formats if height(item) <= 360]
+        if fallback_video and audio_formats:
+            video = max(fallback_video, key=lambda item: height(item))
+            audio = max(audio_formats, key=lambda item: float(item.get("abr") or item.get("tbr") or 0))
+            return f"{video['format_id']}+{audio['format_id']}"
+
         raise RemoteImportError(
-            "This video cannot fit the import limit in a browser-compatible format. Try a shorter video."
+            "This platform did not provide a size estimate for a browser-compatible video under the import limit. Try a shorter video or upload a local copy."
         )
     return max(choices, key=lambda choice: choice[0])[1]
 
