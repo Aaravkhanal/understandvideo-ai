@@ -500,28 +500,6 @@ For detailed offline preparation, see [Offline Demo Guide](docs/offline_demo.md)
 
 ---
 
-## 🖼️ Qualitative Capabilities
-
-<details open>
-<summary><b>Click to expand qualitative demonstration samples</b></summary>
-<br>
-
-### Video Reasoning & Action Recognition
-![sample1](docs/demo_samples/video_reasoning-min.png)
-![sample22](docs/demo_samples/action_recognition-min.png)
-
-### Creative Synthesis & Question Answering
-![sample5](docs/demo_samples/creative_and_generative-min.png)
-![sample14](docs/demo_samples/question_answering-min.png)
-
-### Temporal & Spatial Scene Comprehension
-![sample18](docs/demo_samples/temporal_understanding-min.png)
-![sample8](docs/demo_samples/spatial_understanding-min.png)
-
-</details>
-
----
-
 ## 🛠️ Training & Fine-Tuning
 
 The legacy research stack pins PyTorch, Transformers, Gradio, and Pydantic
