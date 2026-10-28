@@ -49,6 +49,18 @@ function importMetrics(job) {
   return parts.join(' · ');
 }
 
+function youtubeVideoId(value) {
+  try {
+    const url = new URL(value);
+    const host = url.hostname.toLowerCase().replace(/^www\./, '');
+    if (host === 'youtu.be') return url.pathname.split('/').filter(Boolean)[0] || '';
+    if (!['youtube.com', 'm.youtube.com', 'youtube-nocookie.com'].includes(host)) return '';
+    if (url.pathname === '/watch') return url.searchParams.get('v') || '';
+    const match = url.pathname.match(/^\/(?:embed|shorts|live)\/([^/?]+)/);
+    return match?.[1] || '';
+  } catch { return ''; }
+}
+
 async function apiFetch(input, init = {}) {
   const headers = new Headers(init.headers || {});
   const selectedWorkspace = window.localStorage.getItem('understandvideo.workspace');
@@ -184,6 +196,7 @@ function WorkspaceApp({ previewMode = false, onRequestSignIn = () => {} }) {
   const [urlInput, setUrlInput] = useState('');
   const [importingUrl, setImportingUrl] = useState(false);
   const [importJob, setImportJob] = useState(null);
+  const [youtubePreviewId, setYoutubePreviewId] = useState('');
   const [importHint, setImportHint] = useState(null);
   const [repairingImport, setRepairingImport] = useState(false);
   const [editingVideoId, setEditingVideoId] = useState('');
@@ -1021,6 +1034,7 @@ function WorkspaceApp({ previewMode = false, onRequestSignIn = () => {} }) {
       }
       if (result.status === 'failed' || result.status === 'cancelled') {
         setImportingUrl(false);
+        if (result.status === 'failed') setYoutubePreviewId(youtubeVideoId(result.source_url || urlInput));
         setToast(result.error || (result.status === 'cancelled' ? 'Import cancelled' : 'The online video could not be imported'));
         return;
       }
@@ -1070,6 +1084,7 @@ function WorkspaceApp({ previewMode = false, onRequestSignIn = () => {} }) {
       return;
     }
     setImportingUrl(true);
+    setYoutubePreviewId('');
     setToast('Importing the public video…');
     try {
       const response = await apiFetch(`${API_BASE}/api/imports`, {
@@ -1313,11 +1328,16 @@ function WorkspaceApp({ previewMode = false, onRequestSignIn = () => {} }) {
         <form className="url-import" onSubmit={importFromUrl}>
           <Link2 size={19} />
           <label htmlFor="video-url"><strong>Analyze a public video link</strong><span>YouTube, Instagram, TikTok, Vimeo, X, Facebook, Twitch, Reddit, or a direct video URL</span></label>
-          <input id="video-url" ref={urlInputRef} type="url" inputMode="url" value={urlInput} onChange={event => setUrlInput(event.target.value)} placeholder="https://…" disabled={importingUrl} />
+          <input id="video-url" ref={urlInputRef} type="url" inputMode="url" value={urlInput} onChange={event => { setUrlInput(event.target.value); setYoutubePreviewId(''); }} placeholder="https://…" disabled={importingUrl} />
           <button type="submit" disabled={!urlInput.trim() || importingUrl}>{importingUrl ? 'Importing…' : 'Import link'} <ArrowRight size={14} /></button>
         </form>
         {importHint && !importJob && <div className={`import-hint ${importHint.supported === false ? 'unsupported' : ''}`}><strong>{importHint.platform || (importHint.checking ? 'Checking this link' : 'Link support')}</strong><span>{importHint.message}</span></div>}
         {importJob && importJob.status !== 'ready' && <div className="import-status"><span><strong>{importJob.platform ? `${importJob.platform} · ` : ''}{importJob.detail || 'Preparing import'}</strong><small>{importJob.status === 'failed' ? importJob.error : importJob.status === 'cancelled' ? 'The download was stopped.' : `${importJob.progress || 0}% complete${importMetrics(importJob) ? ` · ${importMetrics(importJob)}` : ''}`}</small></span>{['queued', 'processing', 'cancelling'].includes(importJob.status) ? <><i><em style={{ width: `${importJob.progress || 0}%` }} /></i><button onClick={cancelImport} disabled={importJob.status === 'cancelling'}>{importJob.status === 'cancelling' ? 'Cancelling…' : 'Cancel'}</button></> : <><button onClick={retryImport}>Retry</button><button onClick={() => setImportJob(null)}>Dismiss</button></>}</div>}
+        {youtubePreviewId && importJob?.status === 'failed' && <section className="youtube-preview" aria-label="YouTube video preview">
+          <div className="youtube-preview-heading"><div><span>PUBLIC VIDEO</span><strong>Watch it here</strong></div><a href={`https://www.youtube.com/watch?v=${encodeURIComponent(youtubePreviewId)}`} target="_blank" rel="noreferrer">Open on YouTube <ArrowRight size={13} /></a></div>
+          <div className="youtube-preview-frame"><iframe src={`https://www.youtube-nocookie.com/embed/${encodeURIComponent(youtubePreviewId)}`} title="YouTube video player" referrerPolicy="strict-origin-when-cross-origin" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowFullScreen /></div>
+          <p>You can watch the public video here. This server could not retrieve its media, so AI answers and timestamps are unavailable until you upload a video copy.</p>
+        </section>}
 
         <section className={`quick-upload ${dragging ? 'dragging' : ''}`} {...uploadDropHandlers}>
           <div className="upload-badge"><UploadCloud size={20} /></div>
