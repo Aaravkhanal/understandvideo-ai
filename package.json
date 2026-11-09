@@ -20,7 +20,7 @@
     "test:load": "scripts/python.sh scripts/load_test.py"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.118.0",
+    "@supabase/supabase-js": "^2.119.0",
     "@vitejs/plugin-react": "6.1.2",
     "concurrently": "10.0.6",
     "lucide-react": "1.59.0",
