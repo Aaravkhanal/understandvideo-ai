@@ -13,6 +13,7 @@ import re
 import shutil
 import subprocess
 import secrets
+import tempfile
 import time
 import urllib.request
 import uuid
@@ -299,6 +300,31 @@ def storage() -> LocalStorage:
     return LocalStorage(UPLOADS)
 
 
+def widen_postgres_millisecond_timestamps(connection: Any) -> None:
+    # Serialize schema upgrades when API and job workers start together.
+    connection.execute("SELECT pg_advisory_xact_lock(984073522)")
+    for table, columns in {
+        "annotations": ("created_at",),
+        "conversations": ("created_at", "updated_at"),
+        "messages": ("created_at",),
+        "video_comments": ("created_at",),
+        "video_tags": ("created_at",),
+    }.items():
+        old_columns = {
+            row["column_name"]
+            for row in connection.execute(
+                """
+                SELECT column_name FROM information_schema.columns
+                WHERE table_schema = current_schema() AND table_name = ? AND data_type = 'integer'
+                """,
+                (table,),
+            )
+        }
+        changes = [f"ALTER COLUMN {column} TYPE BIGINT" for column in columns if column in old_columns]
+        if changes:
+            connection.execute(f"ALTER TABLE {table} " + ", ".join(changes))
+
+
 def initialize() -> None:
     storage().ensure_ready()
     if not using_postgres():
@@ -350,14 +376,14 @@ def initialize() -> None:
               conversation_id TEXT NOT NULL,
               role TEXT NOT NULL,
               content TEXT NOT NULL,
-              created_at INTEGER NOT NULL
+              created_at BIGINT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS conversations (
               id TEXT PRIMARY KEY,
               video_id TEXT NOT NULL,
               title TEXT NOT NULL,
-              created_at INTEGER NOT NULL,
-              updated_at INTEGER NOT NULL,
+              created_at BIGINT NOT NULL,
+              updated_at BIGINT NOT NULL,
               FOREIGN KEY (video_id) REFERENCES videos(id) ON DELETE CASCADE
             );
             CREATE TABLE IF NOT EXISTS analysis_jobs (
@@ -435,7 +461,7 @@ def initialize() -> None:
               account_id TEXT NOT NULL,
               timestamp REAL NOT NULL,
               note TEXT NOT NULL,
-              created_at INTEGER NOT NULL,
+              created_at BIGINT NOT NULL,
               FOREIGN KEY (video_id) REFERENCES videos(id) ON DELETE CASCADE,
               FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE,
               FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
@@ -443,7 +469,7 @@ def initialize() -> None:
             CREATE TABLE IF NOT EXISTS video_tags (
               video_id TEXT NOT NULL,
               tag TEXT NOT NULL,
-              created_at INTEGER NOT NULL,
+              created_at BIGINT NOT NULL,
               PRIMARY KEY (video_id, tag),
               FOREIGN KEY (video_id) REFERENCES videos(id) ON DELETE CASCADE
             );
@@ -499,7 +525,7 @@ def initialize() -> None:
               account_id TEXT NOT NULL,
               body TEXT NOT NULL,
               timestamp REAL,
-              created_at INTEGER NOT NULL,
+              created_at BIGINT NOT NULL,
               FOREIGN KEY (video_id) REFERENCES videos(id) ON DELETE CASCADE,
               FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
             );
@@ -563,6 +589,8 @@ def initialize() -> None:
               ON workspace_invitations(workspace_id, created_at DESC);
             """
         )
+        if using_postgres():
+            widen_postgres_millisecond_timestamps(connection)
         now = int(time.time())
         connection.execute(
             "INSERT OR IGNORE INTO accounts (id, email, display_name, created_at) VALUES (?, NULL, ?, ?)",
@@ -2839,6 +2867,32 @@ def grounded_answer(question: str, duration: float) -> str:
     return f"The most relevant evidence appears near [[{int(moment // 60):02d}:{int(moment % 60):02d}]]. Based on that moment, the clip centers on a runner moving through a large mountain landscape at sunrise."
 
 
+def answer_from_saved_video(video: Any, question: str, history: list[dict], transcript: list[dict]) -> str:
+    path = Path(video["path"])
+    duration = video["duration"] or 12
+    if path.is_file() or not video["storage_key"]:
+        return answer_video_question(path, question, history, duration, grounded_answer, transcript)
+
+    # Render can discard its local working files during a restart or deploy.
+    try:
+        url = storage().signed_url(video["storage_key"])
+        if not url:
+            raise StorageError("Private video storage is unavailable")
+        with tempfile.TemporaryDirectory(dir=UPLOADS) as directory:
+            working_copy = Path(directory) / path.name
+            with urllib.request.urlopen(url, timeout=30) as response, working_copy.open("wb") as output:
+                remaining = MAX_UPLOAD_BYTES
+                while chunk := response.read(1024 * 1024):
+                    remaining -= len(chunk)
+                    if remaining < 0:
+                        raise StorageError("Saved video exceeds the configured media limit")
+                    output.write(chunk)
+            return answer_video_question(working_copy, question, history, duration, grounded_answer, transcript)
+    except (StorageError, OSError) as exc:
+        logger.warning("Could not restore media for video chat: %s", type(exc).__name__)
+        raise HTTPException(status_code=502, detail="Could not load the saved video for analysis. Try again.") from exc
+
+
 @app.post("/api/chat/stream")
 async def stream_chat(request: Request, payload: ChatRequest) -> StreamingResponse:
     remaining = enforce_rate_limit("chat", limit=CHAT_REQUESTS_PER_HOUR)
@@ -2875,13 +2929,7 @@ async def stream_chat(request: Request, payload: ChatRequest) -> StreamingRespon
     history = [dict(row) for row in reversed(history_rows)]
     transcript = [dict(row) for row in transcript_rows]
     answer = await asyncio.to_thread(
-        answer_video_question,
-        Path(video["path"]),
-        payload.message,
-        history,
-        video["duration"] or 12,
-        grounded_answer,
-        transcript,
+        answer_from_saved_video, video, payload.message, history, transcript,
     )
     now = int(time.time() * 1000)
     with db() as connection:
