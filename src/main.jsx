@@ -1243,7 +1243,12 @@ function WorkspaceApp({ previewMode = false, onRequestSignIn = () => {} }) {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ video_id: videoId, message: question, conversation_id: conversationId || undefined })
         });
-        if (!response.ok || !response.body) throw new Error('Stream unavailable');
+        setApiOnline(true);
+        if (!response.ok) {
+          const failure = await response.json().catch(() => ({}));
+          throw new Error(typeof failure.detail === 'string' ? failure.detail : `Video chat failed (HTTP ${response.status}). Try again.`);
+        }
+        if (!response.body) throw new Error('Video chat returned an empty response. Try again.');
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
         let buffer = '', shown = '';
@@ -1272,9 +1277,18 @@ function WorkspaceApp({ previewMode = false, onRequestSignIn = () => {} }) {
         setStreaming(false);
         void loadConversations(videoId, streamedConversationId);
         return;
-      } catch {
-        setApiOnline(false);
-        setToast(sourceType === 'demo' ? 'Connection changed · using the local demo' : 'Connection lost · no answer was invented');
+      } catch (error) {
+        if (sourceType === 'demo') {
+          setToast('Using the local demo');
+        } else {
+          setMessages(old => [...old.filter(item => item.id !== 'stream'), {
+            id: crypto.randomUUID(), role: 'assistant', text: error instanceof TypeError
+              ? 'Could not connect to video chat. Check your connection and try again.'
+              : error.message || 'Video chat could not complete. Try again.'
+          }]);
+          setStreaming(false);
+          return;
+        }
       }
     }
     completeClientReply(question);

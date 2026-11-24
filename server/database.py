@@ -26,7 +26,7 @@ def _postgres_sql(sql: str) -> str:
     sql = re.sub(r"\bMAX\(([^(),]+),\s*([^()]+)\)", r"GREATEST(\1, \2)", sql, flags=re.IGNORECASE)
     sql = re.sub(r"\bMIN\(([^(),]+),\s*([^()]+)\)", r"LEAST(\1, \2)", sql, flags=re.IGNORECASE)
     sql = re.sub(r"GROUP_CONCAT\(([^,]+),\s*('(?:[^']|'')*')\)", r"STRING_AGG(\1, \2)", sql, flags=re.IGNORECASE)
-    sql = re.sub(r",\s*rowid\b", "", sql, flags=re.IGNORECASE)
+    sql = re.sub(r",\s*rowid\b(?:\s+(?:ASC|DESC)\b)?", "", sql, flags=re.IGNORECASE)
 
     out: list[str] = []
     quoted = False
